@@ -9,11 +9,11 @@ from telethon.tl.types import InputPeerEmpty
 import logging
 
 # Конфигурация
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
+API_ID = 29238968
+API_HASH = '693fa412a819664c59ec5f1989755842'
 BOT_TOKEN = '8274874473:AAGQTVHI3CkwzotIuqiS6M2Whptcp-EpTnY'
 OWNER_ID = 8524326478
-SESSION_NAME = '+380962151936'
+SESSION_NAME = '+380962151936.session'
 
 # Настройка логирования
 logging.basicConfig(
@@ -378,6 +378,9 @@ class AdvancedAutoDeleteBot:
         # Регистрируем обработчики команд
         self.register_command_handlers()
         
+        # Регистрируем обработчик callback запросов
+        self.register_callback_handler()
+        
         # Отправляем приветственное сообщение
         await self.send_welcome_message()
         
@@ -500,6 +503,151 @@ class AdvancedAutoDeleteBot:
                                 await self.add_user_from_forwarded(event, user)
                             except Exception as e:
                                 await event.reply(f"❌ Ошибка: {str(e)}")
+    
+    def register_callback_handler(self):
+        """Регистрация обработчика callback запросов"""
+        
+        @self.bot.on(events.CallbackQuery)
+        async def callback_handler(event):
+            """Обработчик callback запросов"""
+            try:
+                data = event.data.decode('utf-8')
+                
+                if data == 'main_menu':
+                    await self.show_main_menu(event)
+                
+                elif data == 'user_mgmt':
+                    await self.show_add_user_menu(event)
+                
+                elif data == 'chat_mgmt':
+                    await self.show_chat_management(event)
+                
+                elif data == 'stats':
+                    await self.show_stats(event)
+                
+                elif data == 'settings':
+                    await self.show_settings_menu(event)
+                
+                elif data == 'quick_add':
+                    await event.edit(
+                        "➕ **Быстрое добавление пользователя**\n\n"
+                        "Отправьте мне:\n"
+                        "• @username пользователя\n"
+                        "• Или перешлите сообщение от него\n\n"
+                        "Или используйте команду:\n"
+                        "`/add @username`",
+                        buttons=[[Button.inline("↩️ Назад", b"main_menu")]]
+                    )
+                
+                elif data == 'mass_clean':
+                    await event.edit(
+                        "🗑️ **Массовая очистка**\n\n"
+                        "Эта функция позволяет удалить все ваши сообщения в чате.\n\n"
+                        "Для использования отправьте команду:\n"
+                        "`/clean 24` - удалит сообщения старше 24 часов",
+                        buttons=[[Button.inline("↩️ Назад", b"main_menu")]]
+                    )
+                
+                elif data == 'refresh':
+                    await self.show_main_menu(event)
+                
+                elif data == 'help':
+                    await self.show_help(event)
+                
+                elif data == 'refresh_stats':
+                    await self.show_stats(event)
+                
+                elif data == 'detailed_stats':
+                    await self.show_detailed_stats(event)
+                
+                elif data == 'toggle_chat_mode':
+                    self.config['enabled_for_all'] = not self.config['enabled_for_all']
+                    self.save_config()
+                    
+                    mode = "🌐 Все чаты" if self.config['enabled_for_all'] else "💬 Только выбранные"
+                    await event.answer(f"Режим изменен: {mode}", alert=False)
+                    await self.show_chat_management(event)
+                
+                elif data == 'add_chat_menu':
+                    await event.edit(
+                        "➕ **Добавление чата**\n\n"
+                        "Перешлите мне сообщение из чата или используйте команду:\n"
+                        "`/add_chat ID_чата`\n\n"
+                        "Чтобы получить ID чата, добавьте бота @getidsbot в нужный чат.",
+                        buttons=[[Button.inline("↩️ Назад", b"chat_mgmt")]]
+                    )
+                
+                elif data == 'remove_chat_menu':
+                    await self.show_chats_for_removal(event)
+                
+                elif data == 'list_chats':
+                    await self.show_chats_list(event)
+                
+                elif data == 'refresh_chats':
+                    await self.refresh_chats_list(event)
+                
+                elif data == 'search_username':
+                    await event.edit(
+                        "🔍 **Поиск по username**\n\n"
+                        "Введите username пользователя (например: @username):",
+                        buttons=[[Button.inline("↩️ Назад", b"user_mgmt")]]
+                    )
+                
+                elif data == 'list_chats_search':
+                    await self.show_chats_for_member_search(event)
+                
+                elif data.startswith('blacklist_page_'):
+                    page = int(data.split('_')[-1])
+                    await self.show_blacklist_page(event, page)
+                
+                elif data == 'remove_user_menu':
+                    await self.show_users_for_removal(event)
+                
+                elif data.startswith('remove_user_'):
+                    user_id = int(data.split('_')[-1])
+                    await self.remove_user_by_id(event, user_id)
+                
+                elif data.startswith('remove_chat_'):
+                    chat_id = int(data.split('_')[-1])
+                    await self.remove_chat_by_id(event, chat_id)
+                
+                elif data == 'command_examples':
+                    await event.edit(
+                        "📚 **Примеры команд:**\n\n"
+                        "`/add @username` - добавить по username\n"
+                        "`/add 123456789` - добавить по ID\n"
+                        "`/add https://t.me/username` - добавить по ссылке\n"
+                        "`/list` - показать черный список\n"
+                        "`/stats` - статистика\n"
+                        "`/chats` - управление чатами\n"
+                        "`/toggle` - вкл/выкл мониторинг\n\n"
+                        "📌 **Совет:** Просто перешлите сообщение от пользователя для быстрого добавления!",
+                        buttons=[[Button.inline("↩️ Назад", b"help")]]
+                    )
+                
+                elif data == 'troubleshooting':
+                    await event.edit(
+                        "⚠️ **Решение проблем:**\n\n"
+                        "**1. Бот не удаляет сообщения:**\n"
+                        "• Проверьте, что бот администратор в чате\n"
+                        "• Убедитесь, что пользователь в черном списке\n"
+                        "• Проверьте, включен ли мониторинг (`/toggle`)\n\n"
+                        "**2. Не могу добавить пользователя:**\n"
+                        "• Проверьте правильность username или ID\n"
+                        "• Попробуйте переслать сообщение от пользователя\n\n"
+                        "**3. Бот не отвечает:**\n"
+                        "• Перезапустите бота\n"
+                        "• Проверьте интернет-соединение\n\n"
+                        "**4. Уведомления не приходят:**\n"
+                        "• Проверьте настройки уведомлений в меню",
+                        buttons=[[Button.inline("↩️ Назад", b"help")]]
+                    )
+                
+                await event.answer()
+                
+            except Exception as e:
+                logger.error(f"Ошибка в callback обработчике: {e}")
+                await event.answer("❌ Произошла ошибка", alert=True)
     
     async def handle_owner_command(self, event):
         """Обработка команд от владельца"""
@@ -857,151 +1005,6 @@ class AdvancedAutoDeleteBot:
             f"🔄 Очистка сообщений старше {hours} часов...\n\n"
             f"Эта функция в разработке."
         )
-    
-    @self.bot.on(events.CallbackQuery)
-    async def callback_handler(event):
-        """Обработчик callback запросов"""
-        try:
-            data = event.data.decode('utf-8')
-            
-            if data == 'main_menu':
-                await self.show_main_menu(event)
-            
-            elif data == 'user_mgmt':
-                await self.show_add_user_menu(event)
-            
-            elif data == 'chat_mgmt':
-                await self.show_chat_management(event)
-            
-            elif data == 'stats':
-                await self.show_stats(event)
-            
-            elif data == 'settings':
-                await self.show_settings_menu(event)
-            
-            elif data == 'quick_add':
-                await event.edit(
-                    "➕ **Быстрое добавление пользователя**\n\n"
-                    "Отправьте мне:\n"
-                    "• @username пользователя\n"
-                    "• Или перешлите сообщение от него\n\n"
-                    "Или используйте команду:\n"
-                    "`/add @username`",
-                    buttons=[[Button.inline("↩️ Назад", b"main_menu")]]
-                )
-            
-            elif data == 'mass_clean':
-                await event.edit(
-                    "🗑️ **Массовая очистка**\n\n"
-                    "Эта функция позволяет удалить все ваши сообщения в чате.\n\n"
-                    "Для использования отправьте команду:\n"
-                    "`/clean 24` - удалит сообщения старше 24 часов",
-                    buttons=[[Button.inline("↩️ Назад", b"main_menu")]]
-                )
-            
-            elif data == 'refresh':
-                await self.show_main_menu(event)
-            
-            elif data == 'help':
-                await self.show_help(event)
-            
-            elif data == 'refresh_stats':
-                await self.show_stats(event)
-            
-            elif data == 'detailed_stats':
-                await self.show_detailed_stats(event)
-            
-            elif data == 'toggle_chat_mode':
-                self.config['enabled_for_all'] = not self.config['enabled_for_all']
-                self.save_config()
-                
-                mode = "🌐 Все чаты" if self.config['enabled_for_all'] else "💬 Только выбранные"
-                await event.answer(f"Режим изменен: {mode}", alert=False)
-                await self.show_chat_management(event)
-            
-            elif data == 'add_chat_menu':
-                await event.edit(
-                    "➕ **Добавление чата**\n\n"
-                    "Перешлите мне сообщение из чата или используйте команду:\n"
-                    "`/add_chat ID_чата`\n\n"
-                    "Чтобы получить ID чата, добавьте бота @getidsbot в нужный чат.",
-                    buttons=[[Button.inline("↩️ Назад", b"chat_mgmt")]]
-                )
-            
-            elif data == 'remove_chat_menu':
-                await self.show_chats_for_removal(event)
-            
-            elif data == 'list_chats':
-                await self.show_chats_list(event)
-            
-            elif data == 'refresh_chats':
-                await self.refresh_chats_list(event)
-            
-            elif data == 'search_username':
-                await event.edit(
-                    "🔍 **Поиск по username**\n\n"
-                    "Введите username пользователя (например: @username):",
-                    buttons=[[Button.inline("↩️ Назад", b"user_mgmt")]]
-                )
-            
-            elif data == 'list_chats_search':
-                await self.show_chats_for_member_search(event)
-            
-            elif data.startswith('blacklist_page_'):
-                page = int(data.split('_')[-1])
-                await self.show_blacklist_page(event, page)
-            
-            elif data == 'remove_user_menu':
-                await self.show_users_for_removal(event)
-            
-            elif data.startswith('remove_user_'):
-                user_id = int(data.split('_')[-1])
-                await self.remove_user_by_id(event, user_id)
-            
-            elif data.startswith('remove_chat_'):
-                chat_id = int(data.split('_')[-1])
-                await self.remove_chat_by_id(event, chat_id)
-            
-            elif data == 'command_examples':
-                await event.edit(
-                    "📚 **Примеры команд:**\n\n"
-                    "`/add @username` - добавить по username\n"
-                    "`/add 123456789` - добавить по ID\n"
-                    "`/add https://t.me/username` - добавить по ссылке\n"
-                    "`/list` - показать черный список\n"
-                    "`/stats` - статистика\n"
-                    "`/chats` - управление чатами\n"
-                    "`/toggle` - вкл/выкл мониторинг\n\n"
-                    "📌 **Совет:** Просто перешлите сообщение от пользователя для быстрого добавления!",
-                    buttons=[[Button.inline("↩️ Назад", b"help")]]
-                )
-            
-            elif data == 'troubleshooting':
-                await event.edit(
-                    "⚠️ **Решение проблем:**\n\n"
-                    "**1. Бот не удаляет сообщения:**\n"
-                    "• Проверьте, что бот администратор в чате\n"
-                    "• Убедитесь, что пользователь в черном списке\n"
-                    "• Проверьте, включен ли мониторинг (`/toggle`)\n\n"
-                    "**2. Не могу добавить пользователя:**\n"
-                    "• Проверьте правильность username или ID\n"
-                    "• Попробуйте переслать сообщение от пользователя\n\n"
-                    "**3. Бот не отвечает:**\n"
-                    "• Перезапустите бота\n"
-                    "• Проверьте интернет-соединение\n\n"
-                    "**4. Уведомления не приходят:**\n"
-                    "• Проверьте настройки уведомлений в меню",
-                    buttons=[[Button.inline("↩️ Назад", b"help")]]
-                )
-            
-            elif data == 'refresh_stats':
-                await self.show_stats(event)
-            
-            await event.answer()
-            
-        except Exception as e:
-            logger.error(f"Ошибка в callback обработчике: {e}")
-            await event.answer("❌ Произошла ошибка", alert=True)
     
     async def show_settings_menu(self, event):
         """Показать меню настроек"""
