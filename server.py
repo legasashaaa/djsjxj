@@ -1,19 +1,16 @@
 import asyncio
 import json
 import os
-import re
 from datetime import datetime
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
 import logging
 
-# Конфигурация - ОБА: и бот, и сессия
-API_ID = 2040  # Телеграм API ID
-API_HASH = 'b18441a1ff607e10a989891a5462e627'  # Телеграм API Hash
-BOT_TOKEN = '8274874473:AAGQTVHI3CkwzotIuqiS6M2Whptcp-EpTnY'  # Ваш токен бота
-OWNER_ID = 8524326478  # Ваш ID
-SESSION_NAME = '+380962151936'  # Имя сессии вашего аккаунта
+# Конфигурация
+API_ID = 2040
+API_HASH = 'b18441a1ff607e10a989891a5462e627'
+BOT_TOKEN = '8274874473:AAGQTVHI3CkwzotIuqiS6M2Whptcp-EpTnY'
+OWNER_ID = 8524326478
+SESSION_NAME = '+380962151936'
 
 # Настройка логирования
 logging.basicConfig(
@@ -22,83 +19,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Файлы для хранения данных
+# Файл для хранения данных
 CONFIG_FILE = 'bot_config.json'
-CACHE_FILE = 'cache.json'
 
-class BotInterface:
-    """Класс для работы с ботом (кнопки, меню)"""
-    
-    def __init__(self, token):
-        self.token = token
-        self.bot = None
-        self.user_client = None  # Клиент для сессии пользователя
-        self.config = {}
-        self.active_monitoring = True
-        self.deletion_stats = {
-            'total_deleted': 0,
-            'deleted_today': 0,
-            'by_user': {},
-            'by_chat': {}
-        }
-        
-    async def initialize(self):
-        """Инициализация бота"""
-        logger.info("Инициализация бота...")
-        
-        # Загружаем конфигурацию
+class AutoDeleteBot:
+    def __init__(self):
         self.config = self.load_config()
+        self.active_monitoring = True
+        self.deletion_count = 0
         
-        # Создаем клиент для бота
-        self.bot = TelegramClient(
+        # Клиент для бота (кнопки, меню)
+        self.bot_client = TelegramClient(
             'bot_session',
             API_ID,
             API_HASH
         )
         
-        # Запускаем бота с токеном
-        await self.bot.start(bot_token=self.token)
-        
-        # Получаем информацию о боте
-        me = await self.bot.get_me()
-        logger.info(f"🤖 Бот запущен как @{me.username}")
-        
-        # Регистрируем обработчики команд бота
-        await self.register_bot_handlers()
-        
-        return self.bot
-    
-    async def start_user_session(self):
-        """Запуск сессии пользователя для удаления сообщений"""
-        logger.info("Запуск сессии пользователя...")
-        
-        # Создаем клиент для сессии пользователя
+        # Клиент для сессии пользователя (удаление)
         self.user_client = TelegramClient(
             SESSION_NAME,
             API_ID,
             API_HASH
         )
         
-        # Запускаем сессию пользователя
-        await self.user_client.start()
-        
-        # Получаем информацию о пользователе
-        user_me = await self.user_client.get_me()
-        logger.info(f"👤 Сессия пользователя: {user_me.first_name} (ID: {user_me.id})")
-        
-        # Регистрируем обработчик для удаления сообщений
-        await self.register_user_handlers()
-        
-        return self.user_client
-    
     def load_config(self):
         """Загрузка конфигурации"""
         default_config = {
             'blacklist': [],  # Список пользователей
             'enabled_chats': [],  # Список чатов
             'enabled_for_all': True,  # Работать во всех чатах
-            'delete_notifications': True,  # Уведомления
-            'delete_delay': 0  # Задержка удаления
+            'delete_notifications': False  # Выключить уведомления
         }
         
         try:
@@ -118,84 +68,124 @@ class BotInterface:
         except Exception as e:
             logger.error(f"Ошибка сохранения конфигурации: {e}")
     
-    async def register_bot_handlers(self):
+    def is_user_in_blacklist(self, user_id, username=None):
+        """Проверка, находится ли пользователь в черном списке"""
+        for user in self.config['blacklist']:
+            # Проверка по ID
+            if user['id'] == user_id:
+                return True, user
+            
+            # Проверка по username
+            if username and user.get('username'):
+                if user['username'].lower() == username.lower():
+                    return True, user
+        
+        return False, None
+    
+    async def start(self):
+        """Запуск бота"""
+        logger.info("Запуск бота для автоматического удаления сообщений...")
+        
+        # Запускаем бота (для кнопок и меню)
+        await self.bot_client.start(bot_token=BOT_TOKEN)
+        bot_me = await self.bot_client.get_me()
+        logger.info(f"🤖 Бот запущен: @{bot_me.username}")
+        
+        # Запускаем сессию пользователя (для удаления сообщений)
+        await self.user_client.start()
+        user_me = await self.user_client.get_me()
+        logger.info(f"👤 Сессия пользователя: {user_me.first_name} (ID: {user_me.id})")
+        
+        # Регистрируем обработчики для бота (меню, команды)
+        self.register_bot_handlers()
+        
+        # Регистрируем обработчики для сессии пользователя (удаление)
+        self.register_user_handlers()
+        
+        # Отправляем приветственное сообщение
+        await self.send_welcome_message()
+        
+        logger.info("✅ Бот готов к работе!")
+        logger.info(f"👥 Пользователей в черном списке: {len(self.config['blacklist'])}")
+        
+        # Запускаем оба клиента параллельно
+        await asyncio.gather(
+            self.bot_client.run_until_disconnected(),
+            self.user_client.run_until_disconnected()
+        )
+    
+    def register_bot_handlers(self):
         """Регистрация обработчиков для бота (меню, команды)"""
         
-        @self.bot.on(events.NewMessage(pattern='/start'))
+        @self.bot_client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
-            """Обработчик команды /start"""
             if event.sender_id == OWNER_ID:
-                await self.send_main_menu(event)
+                await self.show_main_menu(event)
         
-        @self.bot.on(events.NewMessage(pattern='/menu'))
+        @self.bot_client.on(events.NewMessage(pattern='/menu'))
         async def menu_handler(event):
-            """Обработчик команды /menu"""
             if event.sender_id == OWNER_ID:
-                await self.send_main_menu(event)
+                await self.show_main_menu(event)
         
-        @self.bot.on(events.NewMessage(pattern='/add'))
+        @self.bot_client.on(events.NewMessage(pattern='/add'))
         async def add_handler(event):
-            """Обработчик команды /add"""
             if event.sender_id == OWNER_ID:
-                await self.handle_add_command(event)
+                args = event.message.text.split()
+                if len(args) > 1:
+                    user_input = ' '.join(args[1:])
+                    await self.add_user_command(event, user_input)
+                else:
+                    await self.show_add_menu(event)
         
-        @self.bot.on(events.NewMessage(pattern='/remove'))
+        @self.bot_client.on(events.NewMessage(pattern='/remove'))
         async def remove_handler(event):
-            """Обработчик команды /remove"""
             if event.sender_id == OWNER_ID:
-                await self.handle_remove_command(event)
+                args = event.message.text.split()
+                if len(args) > 1:
+                    user_input = ' '.join(args[1:])
+                    await self.remove_user_command(event, user_input)
+                else:
+                    await self.show_remove_menu(event)
         
-        @self.bot.on(events.NewMessage(pattern='/list'))
+        @self.bot_client.on(events.NewMessage(pattern='/list'))
         async def list_handler(event):
-            """Обработчик команды /list"""
             if event.sender_id == OWNER_ID:
                 await self.show_blacklist(event)
         
-        @self.bot.on(events.NewMessage(pattern='/stats'))
+        @self.bot_client.on(events.NewMessage(pattern='/stats'))
         async def stats_handler(event):
-            """Обработчик команды /stats"""
             if event.sender_id == OWNER_ID:
                 await self.show_stats(event)
         
-        @self.bot.on(events.NewMessage(pattern='/toggle'))
+        @self.bot_client.on(events.NewMessage(pattern='/toggle'))
         async def toggle_handler(event):
-            """Обработчик команды /toggle"""
             if event.sender_id == OWNER_ID:
                 self.active_monitoring = not self.active_monitoring
                 status = "✅ Включен" if self.active_monitoring else "⏸️ Приостановлен"
                 await event.reply(f"**Мониторинг:** {status}")
         
-        @self.bot.on(events.NewMessage(pattern='/help'))
+        @self.bot_client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
-            """Обработчик команды /help"""
             if event.sender_id == OWNER_ID:
                 await self.show_help(event)
         
-        @self.bot.on(events.NewMessage(pattern='/chats'))
-        async def chats_handler(event):
-            """Обработчик команды /chats"""
-            if event.sender_id == OWNER_ID:
-                await self.show_chat_menu(event)
-        
-        # Обработчик пересланных сообщений для добавления пользователей
-        @self.bot.on(events.NewMessage)
+        # Обработка пересланных сообщений
+        @self.bot_client.on(events.NewMessage)
         async def forwarded_handler(event):
-            """Обработка пересланных сообщений"""
             if event.sender_id == OWNER_ID and event.message.forward:
                 await self.handle_forwarded_message(event)
         
         # Обработчик callback запросов (кнопки)
-        @self.bot.on(events.CallbackQuery)
+        @self.bot_client.on(events.CallbackQuery)
         async def callback_handler(event):
-            """Обработчик нажатий на кнопки"""
             await self.handle_callback(event)
     
-    async def register_user_handlers(self):
+    def register_user_handlers(self):
         """Регистрация обработчиков для сессии пользователя (удаление)"""
         
         @self.user_client.on(events.NewMessage())
         async def message_handler(event):
-            """Обработчик сообщений для удаления"""
+            """Обработчик ВСЕХ сообщений для удаления"""
             if not self.active_monitoring:
                 return
             
@@ -230,134 +220,98 @@ class BotInterface:
             sender_username = getattr(sender, 'username', None)
             
             # Проверяем, находится ли отправитель в черном списке
-            is_blacklisted = self.is_user_in_blacklist(sender_id, sender_username)
+            is_blacklisted, user_info = self.is_user_in_blacklist(sender_id, sender_username)
             
             if not is_blacklisted:
                 return
             
             # Удаляем сообщение владельца
             try:
-                # Небольшая задержка для надежности
-                if self.config['delete_delay'] > 0:
-                    await asyncio.sleep(self.config['delete_delay'])
-                
                 await replied_msg.delete()
                 
-                # Обновляем статистику
-                self.deletion_stats['total_deleted'] += 1
-                self.deletion_stats['deleted_today'] += 1
+                # Обновляем счетчик
+                self.deletion_count += 1
                 
-                user_id_str = str(sender_id)
-                chat_id_str = str(chat_id)
+                # Логируем удаление (в консоль, без отправки в Telegram)
+                logger.info(f"🗑️ Удалено сообщение {replied_msg.id} в чате {chat_id}")
+                logger.info(f"👤 Отправитель реплая: {sender_id} ({sender_username})")
                 
-                if user_id_str not in self.deletion_stats['by_user']:
-                    self.deletion_stats['by_user'][user_id_str] = 0
-                self.deletion_stats['by_user'][user_id_str] += 1
-                
-                if chat_id_str not in self.deletion_stats['by_chat']:
-                    self.deletion_stats['by_chat'][chat_id_str] = 0
-                self.deletion_stats['by_chat'][chat_id_str] += 1
-                
-                # Логируем удаление
-                logger.info(f"✅ Удалено сообщение {replied_msg.id} в чате {chat_id}")
-                
-                # Отправляем уведомление через бота
-                if self.config['delete_notifications']:
-                    notification = (
-                        f"🗑️ **Сообщение удалено!**\n\n"
-                        f"👤 **Отправитель реплая:** {sender_id}\n"
-                        f"💬 **Чат:** `{chat_id}`\n"
-                        f"📝 **ID сообщения:** `{replied_msg.id}`\n"
-                        f"⏰ **Время:** {datetime.now().strftime('%H:%M:%S')}"
-                    )
-                    
-                    await self.bot.send_message(OWNER_ID, notification, parse_mode='md')
-                    
             except Exception as e:
-                error_msg = f"❌ Ошибка при удалении: {str(e)}"
-                logger.error(error_msg)
-                
-                if "MESSAGE_DELETE_FORBIDDEN" in str(e):
-                    error_msg += "\n\n⚠️ Нет прав на удаление в этом чате!"
-                
-                await self.bot.send_message(OWNER_ID, error_msg)
+                logger.error(f"❌ Ошибка при удалении: {str(e)}")
                 
         except Exception as e:
             logger.error(f"Ошибка обработки реплая: {e}")
     
-    def is_user_in_blacklist(self, user_id, username=None):
-        """Проверка, находится ли пользователь в черном списке"""
-        for user in self.config['blacklist']:
-            # Проверка по ID
-            if user['id'] == user_id:
-                return True
-            
-            # Проверка по username
-            if username and user.get('username'):
-                if user['username'].lower() == username.lower():
-                    return True
+    async def send_welcome_message(self):
+        """Отправка приветственного сообщения"""
+        welcome_text = (
+            f"🤖 **Бот для автоматического удаления сообщений запущен!**\n\n"
+            f"👤 **Владелец:** {OWNER_ID}\n"
+            f"👥 **Пользователей в черном списке:** {len(self.config['blacklist'])}\n"
+            f"💬 **Мониторинг чатов:** {'🌐 Все чаты' if self.config['enabled_for_all'] else f'💬 {len(self.config['enabled_chats'])} чатов'}\n"
+            f"⚡ **Режим:** {'Активный мониторинг' if self.active_monitoring else 'Приостановлен'}\n\n"
+            f"📋 **Используйте команды:**\n"
+            f"/menu - Главное меню\n"
+            f"/add - Добавить пользователя\n"
+            f"/list - Черный список\n"
+            f"/stats - Статистика\n"
+            f"/help - Помощь"
+        )
         
-        return False
+        try:
+            await self.bot_client.send_message(OWNER_ID, welcome_text, parse_mode='md')
+        except:
+            pass
     
-    async def send_main_menu(self, event):
-        """Отправка главного меню"""
+    async def show_main_menu(self, event):
+        """Показать главное меню"""
         menu_text = (
             f"🤖 **Главное меню - Автоудаление сообщений**\n\n"
             f"📊 **Статистика:**\n"
             f"• 👤 Пользователей в черном списке: **{len(self.config['blacklist'])}**\n"
             f"• 💬 Активных чатов: **{len(self.config['enabled_chats'])}**\n"
-            f"• 🗑️ Всего удалено: **{self.deletion_stats['total_deleted']}**\n"
-            f"• 🗑️ Удалено сегодня: **{self.deletion_stats['deleted_today']}**\n"
+            f"• 🗑️ Всего удалено: **{self.deletion_count}**\n"
             f"• ⚡ Мониторинг: **{'✅ Активен' if self.active_monitoring else '⏸️ Приостановлен'}**\n\n"
             f"🌐 **Режим:** {'Все чаты' if self.config['enabled_for_all'] else 'Только выбранные'}"
         )
         
         buttons = [
-            [Button.inline("👤 Управление пользователями", b"user_management"),
-             Button.inline("💬 Управление чатами", b"chat_management")],
-            [Button.inline("📊 Статистика", b"stats_menu"),
-             Button.inline("⚙️ Настройки", b"settings_menu")],
-            [Button.inline("➕ Быстрое добавление", b"quick_add"),
+            [Button.inline("👤 Управление пользователями", b"user_mgmt"),
+             Button.inline("📊 Статистика", b"stats_menu")],
+            [Button.inline("⚙️ Настройки", b"settings"),
              Button.inline("📋 Помощь", b"help_menu")]
         ]
         
         await event.reply(menu_text, buttons=buttons, parse_mode='md')
     
-    async def handle_add_command(self, event):
-        """Обработка команды добавления"""
-        args = event.message.text.split()
+    async def show_add_menu(self, event):
+        """Показать меню добавления"""
+        text = (
+            "👤 **Добавление пользователя в черный список**\n\n"
+            "**Способы добавления:**\n"
+            "1. **Командой:** `/add @username` или `/add 123456789`\n"
+            "2. **Пересылкой:** Перешлите сообщение от пользователя\n"
+            "3. **По ссылке:** `/add https://t.me/username`\n\n"
+            "**Форматы поддерживаются:**\n"
+            "• ID пользователя (123456789)\n"
+            "• @username\n"
+            "• t.me/username\n"
+            "• Пересланные сообщения"
+        )
         
-        if len(args) < 2:
-            # Показываем меню добавления
-            await event.reply(
-                "👤 **Добавление пользователя**\n\n"
-                "Отправьте:\n"
-                "• ID пользователя\n"
-                "• @username\n"
-                "• Или перешлите сообщение от пользователя\n\n"
-                "Пример: `/add @username`",
-                buttons=[
-                    [Button.inline("📋 Способы добавления", b"add_methods")],
-                    [Button.inline("↩️ Назад", b"main_menu")]
-                ]
-            )
-        else:
-            user_input = ' '.join(args[1:])
-            await self.add_user(event, user_input)
-    
-    async def handle_remove_command(self, event):
-        """Обработка команды удаления"""
-        args = event.message.text.split()
+        buttons = [
+            [Button.inline("📋 Примеры команд", b"examples")],
+            [Button.inline("↩️ Назад", b"main_menu")]
+        ]
         
-        if len(args) < 2:
-            # Показываем черный список для удаления
-            await self.show_blacklist_for_removal(event)
-        else:
-            user_input = ' '.join(args[1:])
-            await self.remove_user(event, user_input)
+        await event.reply(text, buttons=buttons, parse_mode='md')
     
-    async def add_user(self, event, user_input):
-        """Добавление пользователя в черный список"""
+    async def add_user_command(self, event, user_input):
+        """Команда добавления пользователя"""
+        if not user_input:
+            await event.reply("❌ Укажите пользователя для добавления.\nПример: `/add @username`")
+            return
+        
         status_msg = await event.reply("🔄 Обработка...")
         
         # Получаем информацию о пользователе
@@ -368,8 +322,11 @@ class BotInterface:
             return
         
         # Проверяем, есть ли уже пользователь
-        if self.is_user_in_blacklist(user_info['id'], user_info.get('username')):
-            await status_msg.edit("⚠️ Пользователь уже в черном списке!")
+        is_blacklisted, existing_user = self.is_user_in_blacklist(user_info['id'], user_info.get('username'))
+        
+        if is_blacklisted:
+            user_display = self.format_user_display(existing_user)
+            await status_msg.edit(f"⚠️ Пользователь уже в черном списке:\n{user_display}")
             return
         
         # Добавляем пользователя
@@ -379,49 +336,24 @@ class BotInterface:
         user_display = self.format_user_display(user_info)
         
         await status_msg.edit(
-            f"✅ **Пользователь добавлен!**\n\n"
+            f"✅ **Пользователь добавлен в черный список!**\n\n"
             f"{user_display}\n"
-            f"🆔 ID: `{user_info['id']}`"
+            f"🆔 ID: `{user_info['id']}`\n\n"
+            f"Теперь при ЛЮБЫХ реплаях от этого пользователя ваши сообщения будут автоматически удаляться."
         )
         
-        logger.info(f"Добавлен пользователь: {user_display}")
-    
-    async def remove_user(self, event, user_input):
-        """Удаление пользователя из черного списка"""
-        status_msg = await event.reply("🔄 Обработка...")
-        
-        # Получаем информацию о пользователе
-        user_info = await self.get_user_info(user_input)
-        
-        if not user_info:
-            await status_msg.edit("❌ Не удалось найти пользователя.")
-            return
-        
-        # Ищем пользователя в черном списке
-        for i, user in enumerate(self.config['blacklist']):
-            if user['id'] == user_info['id']:
-                # Удаляем пользователя
-                removed_user = self.config['blacklist'].pop(i)
-                self.save_config()
-                
-                user_display = self.format_user_display(removed_user)
-                await status_msg.edit(f"✅ **Пользователь удален:**\n{user_display}")
-                return
-        
-        await status_msg.edit("❌ Пользователь не найден в черном списке.")
+        logger.info(f"Добавлен пользователь: {user_display} (ID: {user_info['id']})")
     
     async def get_user_info(self, user_input):
         """Получение информации о пользователе"""
         try:
-            # Убираем пробелы
             user_input = user_input.strip()
             
             # Если это ID
             if user_input.isdigit():
                 user_id = int(user_input)
                 try:
-                    # Пробуем получить через бота
-                    user = await self.bot.get_entity(user_id)
+                    user = await self.bot_client.get_entity(user_id)
                     return {
                         'id': user.id,
                         'username': getattr(user, 'username', None),
@@ -434,7 +366,7 @@ class BotInterface:
             # Если это @username
             elif user_input.startswith('@'):
                 username = user_input[1:]
-                user = await self.bot.get_entity(username)
+                user = await self.bot_client.get_entity(username)
                 return {
                     'id': user.id,
                     'username': username,
@@ -445,7 +377,7 @@ class BotInterface:
             # Если это ссылка
             elif 't.me/' in user_input:
                 username = user_input.split('t.me/')[-1]
-                user = await self.bot.get_entity(username)
+                user = await self.bot_client.get_entity(username)
                 return {
                     'id': user.id,
                     'username': username,
@@ -473,28 +405,8 @@ class BotInterface:
         
         return display
     
-    async def show_blacklist(self, event):
-        """Показать черный список"""
-        if not self.config['blacklist']:
-            await event.reply("📋 **Черный список пуст.**", parse_mode='md')
-            return
-        
-        text = "📋 **Черный список пользователей:**\n\n"
-        
-        for i, user in enumerate(self.config['blacklist'], 1):
-            user_display = self.format_user_display(user)
-            text += f"{i}. {user_display}\n"
-            text += f"   🆔 `{user['id']}`\n\n"
-        
-        buttons = [
-            [Button.inline("➖ Удалить пользователя", b"remove_user_menu")],
-            [Button.inline("↩️ Назад", b"main_menu")]
-        ]
-        
-        await event.reply(text, buttons=buttons, parse_mode='md')
-    
-    async def show_blacklist_for_removal(self, event):
-        """Показать черный список для удаления"""
+    async def show_remove_menu(self, event):
+        """Показать меню удаления"""
         if not self.config['blacklist']:
             await event.reply("📋 **Черный список пуст.**", parse_mode='md')
             return
@@ -506,21 +418,66 @@ class BotInterface:
             user_display = self.format_user_display(user)[:30]
             buttons.append([Button.inline(f"❌ {user_display}", f"remove_{user['id']}")])
         
-        buttons.append([Button.inline("↩️ Назад", b"main_menu")])
+        buttons.append([Button.inline("↩️ Назад", b"user_mgmt")])
         
         await event.reply(text, buttons=buttons)
+    
+    async def remove_user_command(self, event, user_input):
+        """Команда удаления пользователя"""
+        if not user_input:
+            await self.show_remove_menu(event)
+            return
+        
+        status_msg = await event.reply("🔄 Обработка...")
+        
+        # Получаем информацию о пользователе
+        user_info = await self.get_user_info(user_input)
+        
+        if not user_info:
+            await status_msg.edit("❌ Не удалось найти пользователя.")
+            return
+        
+        # Ищем пользователя в черном списке
+        for i, user in enumerate(self.config['blacklist']):
+            if user['id'] == user_info['id']:
+                # Удаляем пользователя
+                removed_user = self.config['blacklist'].pop(i)
+                self.save_config()
+                
+                user_display = self.format_user_display(removed_user)
+                await status_msg.edit(f"✅ **Пользователь удален:**\n{user_display}")
+                return
+        
+        await status_msg.edit("❌ Пользователь не найден в черном списке.")
+    
+    async def show_blacklist(self, event):
+        """Показать черный список"""
+        if not self.config['blacklist']:
+            await event.reply("📋 **Черный список пуст.**\n\nИспользуйте `/add @username` для добавления пользователей.", parse_mode='md')
+            return
+        
+        text = "📋 **Черный список пользователей:**\n\n"
+        
+        for i, user in enumerate(self.config['blacklist'], 1):
+            user_display = self.format_user_display(user)
+            text += f"{i}. {user_display}\n"
+            text += f"   🆔 `{user['id']}`\n\n"
+        
+        buttons = [
+            [Button.inline("➖ Удалить пользователя", b"remove_menu")],
+            [Button.inline("↩️ Назад", b"main_menu")]
+        ]
+        
+        await event.reply(text, buttons=buttons, parse_mode='md')
     
     async def show_stats(self, event):
         """Показать статистику"""
         stats_text = (
             f"📊 **Статистика бота**\n\n"
-            f"📅 **Дата:** {datetime.now().strftime('%Y-%m-%d')}\n\n"
-            f"**Общая статистика:**\n"
-            f"• 🗑️ Всего удалено сообщений: **{self.deletion_stats['total_deleted']}**\n"
-            f"• 🗑️ Удалено сегодня: **{self.deletion_stats['deleted_today']}**\n"
-            f"• 👤 Пользователей в черном списке: **{len(self.config['blacklist'])}**\n"
-            f"• 💬 Мониторится чатов: **{'Все' if self.config['enabled_for_all'] else len(self.config['enabled_chats'])}**\n"
-            f"• ⚡ Статус мониторинга: **{'✅ Активен' if self.active_monitoring else '⏸️ Приостановлен'}**"
+            f"🗑️ **Всего удалено сообщений:** {self.deletion_count}\n"
+            f"👤 **Пользователей в черном списке:** {len(self.config['blacklist'])}\n"
+            f"💬 **Мониторится чатов:** {'Все' if self.config['enabled_for_all'] else len(self.config['enabled_chats'])}\n"
+            f"⚡ **Статус мониторинга:** {'✅ Активен' if self.active_monitoring else '⏸️ Приостановлен'}"
         )
         
         buttons = [
@@ -544,15 +501,15 @@ class BotInterface:
         `/help` - Эта справка\n\n
         **⚡ Как это работает:**
         1. Добавьте пользователей в черный список
-        2. Бот мониторит все чаты
-        3. При реплае от пользователя из черного списка
+        2. Бот мониторит ВСЕ чаты
+        3. Когда пользователь из черного списка отвечает (реплаит) на ЛЮБОЕ ваше сообщение
         4. Ваше сообщение моментально удаляется
-        5. Вы получаете уведомление\n\n
+        5. Удаляются ВСЕ ваши сообщения, на которые он отвечает\n\n
         **👤 Добавление пользователей:**
         • По ID: `/add 123456789`
         • По @username: `/add @username`
         • По ссылке: `/add t.me/username`
-        • Пересылкой: Просто перешлите сообщение
+        • Пересылкой: Просто перешлите сообщение от пользователя
         """
         
         buttons = [
@@ -561,27 +518,6 @@ class BotInterface:
         ]
         
         await event.reply(help_text, buttons=buttons, parse_mode='md')
-    
-    async def show_chat_menu(self, event):
-        """Показать меню управления чатами"""
-        mode = "🌐 Все чаты" if self.config['enabled_for_all'] else "💬 Только выбранные"
-        
-        text = (
-            f"💬 **Управление чатами**\n\n"
-            f"Текущий режим: **{mode}**\n"
-            f"Активных чатов: **{len(self.config['enabled_chats'])}**\n\n"
-            f"Выберите действие:"
-        )
-        
-        buttons = [
-            [Button.inline("🌐 Переключить режим", b"toggle_chat_mode")],
-            [Button.inline("➕ Добавить чат", b"add_chat")],
-            [Button.inline("➖ Удалить чат", b"remove_chat")],
-            [Button.inline("📋 Список чатов", b"list_chats")],
-            [Button.inline("↩️ Назад", b"main_menu")]
-        ]
-        
-        await event.reply(text, buttons=buttons, parse_mode='md')
     
     async def handle_forwarded_message(self, event):
         """Обработка пересланных сообщений"""
@@ -592,7 +528,7 @@ class BotInterface:
                 
                 # Получаем информацию о пользователе
                 try:
-                    user = await self.bot.get_entity(sender_id)
+                    user = await self.bot_client.get_entity(sender_id)
                     user_info = {
                         'id': user.id,
                         'username': getattr(user, 'username', None),
@@ -601,8 +537,11 @@ class BotInterface:
                     }
                     
                     # Проверяем, есть ли уже пользователь
-                    if self.is_user_in_blacklist(user_info['id'], user_info.get('username')):
-                        await event.reply("⚠️ Пользователь уже в черном списке!")
+                    is_blacklisted, existing_user = self.is_user_in_blacklist(user_info['id'], user_info.get('username'))
+                    
+                    if is_blacklisted:
+                        user_display = self.format_user_display(existing_user)
+                        await event.reply(f"⚠️ Пользователь уже в черном списке:\n{user_display}")
                         return
                     
                     # Добавляем пользователя
@@ -614,7 +553,8 @@ class BotInterface:
                     await event.reply(
                         f"✅ **Пользователь добавлен из пересланного сообщения!**\n\n"
                         f"{user_display}\n"
-                        f"🆔 ID: `{user_info['id']}`"
+                        f"🆔 ID: `{user_info['id']}`\n\n"
+                        f"Теперь при любых реплаях от этого пользователя ваши сообщения будут автоматически удаляться."
                     )
                     
                 except Exception as e:
@@ -629,57 +569,37 @@ class BotInterface:
             data = event.data.decode('utf-8')
             
             if data == 'main_menu':
-                await self.send_main_menu(event)
+                await self.show_main_menu(event)
             
-            elif data == 'user_management':
+            elif data == 'user_mgmt':
                 await event.edit(
                     "👤 **Управление пользователями**\n\n"
                     "Выберите действие:",
                     buttons=[
-                        [Button.inline("➕ Добавить пользователя", b"add_user_menu")],
-                        [Button.inline("➖ Удалить пользователя", b"remove_user_menu")],
-                        [Button.inline("📋 Показать черный список", b"show_blacklist")],
+                        [Button.inline("➕ Добавить пользователя", b"add_menu")],
+                        [Button.inline("➖ Удалить пользователя", b"remove_menu")],
+                        [Button.inline("📋 Показать черный список", b"show_list")],
                         [Button.inline("↩️ Назад", b"main_menu")]
                     ]
                 )
             
-            elif data == 'chat_management':
-                await self.show_chat_menu(event)
-            
             elif data == 'stats_menu':
                 await self.show_stats(event)
-            
-            elif data == 'settings_menu':
-                await self.show_settings(event)
             
             elif data == 'help_menu':
                 await self.show_help(event)
             
-            elif data == 'quick_add':
-                await event.edit(
-                    "➕ **Быстрое добавление**\n\n"
-                    "Просто перешлите любое сообщение от пользователя, "
-                    "которого хотите добавить в черный список.",
-                    buttons=[[Button.inline("↩️ Назад", b"main_menu")]]
-                )
+            elif data == 'settings':
+                await self.show_settings(event)
             
-            elif data == 'add_user_menu':
-                await event.edit(
-                    "👤 **Добавление пользователя**\n\n"
-                    "Отправьте команду:\n"
-                    "`/add @username`\n\n"
-                    "Или перешлите сообщение от пользователя.",
-                    buttons=[[Button.inline("↩️ Назад", b"user_management")]]
-                )
+            elif data == 'add_menu':
+                await self.show_add_menu(event)
             
-            elif data == 'remove_user_menu':
-                await self.show_blacklist_for_removal(event)
+            elif data == 'remove_menu':
+                await self.show_remove_menu(event)
             
-            elif data == 'show_blacklist':
+            elif data == 'show_list':
                 await self.show_blacklist(event)
-            
-            elif data == 'refresh_stats':
-                await self.show_stats(event)
             
             elif data == 'examples':
                 await event.edit(
@@ -691,51 +611,15 @@ class BotInterface:
                     "`/list`\n"
                     "`/stats`\n"
                     "`/toggle`",
-                    buttons=[[Button.inline("↩️ Назад", b"help_menu")]]
+                    buttons=[[Button.inline("↩️ Назад", b"add_menu")]]
                 )
             
-            elif data == 'toggle_chat_mode':
-                self.config['enabled_for_all'] = not self.config['enabled_for_all']
-                self.save_config()
-                
-                mode = "🌐 Все чаты" if self.config['enabled_for_all'] else "💬 Только выбранные"
-                await event.answer(f"Режим изменен: {mode}", alert=False)
-                await self.show_chat_menu(event)
-            
-            elif data == 'add_chat':
-                await event.edit(
-                    "➕ **Добавление чата**\n\n"
-                    "Перешлите сообщение из чата или отправьте ID чата.",
-                    buttons=[[Button.inline("↩️ Назад", b"chat_management")]]
-                )
-            
-            elif data == 'remove_chat':
-                await event.edit(
-                    "➖ **Удаление чата**\n\n"
-                    "Эта функция в разработке.",
-                    buttons=[[Button.inline("↩️ Назад", b"chat_management")]]
-                )
-            
-            elif data == 'list_chats':
-                await event.edit(
-                    "📋 **Список чатов**\n\n"
-                    "Активных чатов: 0",
-                    buttons=[[Button.inline("↩️ Назад", b"chat_management")]]
-                )
+            elif data == 'refresh_stats':
+                await self.show_stats(event)
             
             elif data.startswith('remove_'):
                 user_id = int(data.split('_')[1])
                 await self.remove_user_by_id(event, user_id)
-            
-            elif data == 'add_methods':
-                await event.edit(
-                    "📋 **Способы добавления:**\n\n"
-                    "1. **Командой:** `/add @username`\n"
-                    "2. **По ID:** `/add 123456789`\n"
-                    "3. **По ссылке:** `/add t.me/username`\n"
-                    "4. **Пересылкой:** Просто перешлите сообщение",
-                    buttons=[[Button.inline("↩️ Назад", b"add_user_menu")]]
-                )
             
             await event.answer()
             
@@ -756,7 +640,7 @@ class BotInterface:
                 
                 # Ждем и возвращаемся в меню
                 await asyncio.sleep(2)
-                await self.show_blacklist_for_removal(event)
+                await self.show_remove_menu(event)
                 return
         
         await event.answer("❌ Пользователь не найден", alert=True)
@@ -769,12 +653,13 @@ class BotInterface:
             f"⚙️ **Настройки**\n\n"
             f"**Текущие настройки:**\n"
             f"• 🔔 Уведомления: {notifications}\n"
-            f"• ⏱️ Задержка удаления: {self.config['delete_delay']} сек.\n\n"
+            f"• 🌐 Режим чатов: {'Все чаты' if self.config['enabled_for_all'] else 'Только выбранные'}\n\n"
             f"Выберите настройку для изменения:"
         )
         
         buttons = [
-            [Button.inline("🔔 Уведомления", b"toggle_notifications")],
+            [Button.inline("🔔 Уведомления", b"toggle_notifs")],
+            [Button.inline("🌐 Режим чатов", b"toggle_chat_mode")],
             [Button.inline("↩️ Назад", b"main_menu")]
         ]
         
@@ -783,44 +668,12 @@ class BotInterface:
     async def run(self):
         """Основной метод запуска"""
         try:
-            # Инициализируем бота
-            await self.initialize()
-            
-            # Запускаем сессию пользователя
-            await self.start_user_session()
-            
-            # Отправляем приветственное сообщение
-            await self.send_welcome_message()
-            
-            logger.info("✅ Бот полностью запущен и готов к работе!")
-            
-            # Запускаем оба клиента
-            await asyncio.gather(
-                self.bot.run_until_disconnected(),
-                self.user_client.run_until_disconnected()
-            )
-            
+            await self.start()
         except KeyboardInterrupt:
-            logger.info("Бот остановлен")
+            logger.info("Бот остановлен пользователем")
         except Exception as e:
             logger.error(f"Критическая ошибка: {e}")
             raise
-    
-    async def send_welcome_message(self):
-        """Отправить приветственное сообщение"""
-        welcome_text = (
-            f"🤖 **Бот для автоматического удаления сообщений запущен!**\n\n"
-            f"👤 **Владелец:** {OWNER_ID}\n"
-            f"👥 **Пользователей в черном списке:** {len(self.config['blacklist'])}\n"
-            f"💬 **Мониторинг чатов:** {'🌐 Все чаты' if self.config['enabled_for_all'] else f'💬 {len(self.config['enabled_chats'])} чатов'}\n"
-            f"⚡ **Режим:** {'Активный мониторинг' if self.active_monitoring else 'Приостановлен'}\n\n"
-            f"📋 **Используйте /menu для управления**"
-        )
-        
-        try:
-            await self.bot.send_message(OWNER_ID, welcome_text, parse_mode='md')
-        except:
-            pass
 
 
 # Запуск бота
@@ -832,14 +685,16 @@ async def main():
     print(f"🔑 Токен бота: {BOT_TOKEN[:15]}...")
     print(f"💾 Файл конфигурации: {CONFIG_FILE}")
     print("=" * 60)
-    print("⚡ РАБОТАЕТ КАК:")
-    print("• 🤖 Бот (BotFather) - отправка сообщений и кнопок")
-    print("• 👤 Ваша сессия - удаление сообщений при реплаях")
-    print("• ⚡ Разделение логики - интерфейс и удаление отдельно")
+    print("⚡ ВОЗМОЖНОСТИ:")
+    print("• 🗑️ УДАЛЯЕТ ВСЕ ВАШИ СООБЩЕНИЯ при реплаях")
+    print("• ⚡ РАБОТАЕТ ВО ВСЕХ ЧАТАХ автоматически")
+    print("• 🔕 БЕЗ УВЕДОМЛЕНИЙ - тихое удаление")
+    print("• 📱 УДОБНОЕ МЕНЮ с кнопками")
+    print("• 👤 ПОДДЕРЖКА USERNAME")
     print("=" * 60)
     print("🚀 Запуск...")
     
-    bot = BotInterface(BOT_TOKEN)
+    bot = AutoDeleteBot()
     await bot.run()
 
 
