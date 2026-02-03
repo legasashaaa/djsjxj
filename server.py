@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.types import InputPeerEmpty, InputPeerUser, InputPeerChannel
 import logging
 
 # Конфигурация - ОБА: и бот, и сессия
@@ -41,6 +41,7 @@ class BotInterface:
         self.is_recording = False  # Флаг записи
         self.current_recording = []  # Текущая запись
         self.current_recording_chat = None  # Чат текущей записи
+        self.pending_recording_send = None  # Ожидающая отправка записи
         self.deletion_stats = {
             'total_deleted': 0,
             'deleted_today': 0,
@@ -220,6 +221,13 @@ class BotInterface:
             """Обработчик команды /recordings - показать записи"""
             if event.sender_id == OWNER_ID:
                 await self.show_recordings_menu(event)
+        
+        # Обработчик ввода ID чата для отправки записи
+        @self.bot.on(events.NewMessage)
+        async def chat_input_handler(event):
+            """Обработка ввода ID чата для отправки записи"""
+            if event.sender_id == OWNER_ID and self.pending_recording_send:
+                await self.handle_chat_input(event)
         
         # Обработчик пересланных сообщений для добавления пользователей
         @self.bot.on(events.NewMessage)
@@ -573,104 +581,446 @@ class BotInterface:
         
         recording = self.recordings[recording_id]
         
-        # Спрашиваем куда отправить
         await event.edit(
             f"▶️ **Воспроизведение записи:** {recording.get('name', 'Без названия')}\n\n"
             f"📊 Сообщений: {recording.get('message_count', 0)}\n"
             f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
-            "**Куда отправить запись?**\n"
+            "**Шаг 1: Куда отправить запись?**\n"
             "Отправьте ID чата или username:\n"
-            "Пример: `-1001234567890` или `@username`\n\n"
-            "Или нажмите кнопку ниже для отправки в тот же чат.",
+            "Примеры:\n"
+            "• `-1001234567890` (ID группы/канала)\n"
+            "• `@username` (юзернейм)\n"
+            "• `username` (без @)\n"
+            "• `123456789` (ID пользователя)\n\n"
+            "Или нажмите кнопку 'Отправить сюда'",
             buttons=[
-                [Button.inline("📨 Отправить сюда", f"send_recording_{recording_id}_here")],
+                [Button.inline("📨 Отправить сюда", f"send_here_{recording_id}")],
+                [Button.inline("↩️ Назад", b"recordings_menu")]
+            ]
+        )
+        
+        # Сохраняем ожидающую отправку
+        self.pending_recording_send = {
+            'recording_id': recording_id,
+            'step': 'chat_input',
+            'event': event
+        }
+    
+    async def handle_chat_input(self, event):
+        """Обработка ввода чата для отправки записи"""
+        if not self.pending_recording_send:
+            return
+        
+        try:
+            recording_id = self.pending_recording_send['recording_id']
+            original_event = self.pending_recording_send['event']
+            
+            # Получаем введенный текст
+            chat_input = event.message.text.strip()
+            
+            # Получаем информацию о чате
+            chat_info = await self.get_chat_info(chat_input)
+            
+            if not chat_info:
+                await event.reply("❌ Не удалось найти чат. Попробуйте еще раз.")
+                return
+            
+            # Сохраняем информацию о чате
+            self.pending_recording_send['chat_info'] = chat_info
+            
+            # Переходим к следующему шагу
+            await self.ask_target_user(original_event, recording_id, chat_info)
+            
+            # Удаляем сообщение с вводом
+            await event.delete()
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки ввода чата: {e}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
+        finally:
+            # Не сбрасываем pending_recording_send, переходим к следующему шагу
+            self.pending_recording_send['step'] = 'user_input'
+    
+    async def get_chat_info(self, chat_input):
+        """Получение информации о чате"""
+        try:
+            # Убираем пробелы
+            chat_input = chat_input.strip()
+            
+            # Если это @username или просто username
+            if chat_input.startswith('@'):
+                chat_input = chat_input[1:]
+            
+            # Пробуем получить информацию о чате
+            try:
+                entity = await self.user_client.get_entity(chat_input)
+                return {
+                    'id': entity.id,
+                    'type': 'channel' if hasattr(entity, 'broadcast') else 
+                            'chat' if hasattr(entity, 'megagroup') else 
+                            'user',
+                    'username': getattr(entity, 'username', None),
+                    'title': getattr(entity, 'title', getattr(entity, 'first_name', '')),
+                    'access_hash': getattr(entity, 'access_hash', None)
+                }
+            except:
+                # Пробуем как числовой ID
+                try:
+                    chat_id = int(chat_input)
+                    # Для ID без @ нужно использовать специальные методы
+                    if chat_id < 0:  # Группа/канал
+                        return {'id': chat_id, 'type': 'channel'}
+                    else:  # Пользователь
+                        return {'id': chat_id, 'type': 'user'}
+                except:
+                    return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о чате: {e}")
+            return None
+    
+    async def ask_target_user(self, event, recording_id, chat_info):
+        """Спросить пользователя, за кем следить"""
+        await event.edit(
+            f"✅ **Чат определен:** {chat_info.get('title', f'ID: {chat_info[\"id\"]}')}\n\n"
+            f"**Шаг 2: За кем следить?**\n"
+            f"Введите username или ID пользователя, за сообщениями которого нужно следить:\n"
+            f"Примеры:\n"
+            f"• `@username`\n"
+            f"• `123456789` (ID пользователя)\n\n"
+            f"Бот будет отправлять ваши сообщения, отвечая на последнее сообщение этого пользователя.\n"
+            f"Если пользователь удалит сообщение, бот найдет его предыдущее или следующее сообщение.",
+            buttons=[
+                [Button.inline("🚫 Не следить, отправлять как есть", f"no_tracking_{recording_id}_{chat_info['id']}")],
                 [Button.inline("↩️ Назад", b"recordings_menu")]
             ]
         )
     
-    async def send_recording_to_chat(self, event, recording_id, chat_input=None):
-        """Отправить запись в указанный чат"""
-        if recording_id not in self.recordings:
+    async def process_target_user(self, event, user_input):
+        """Обработка ввода целевого пользователя"""
+        if not self.pending_recording_send:
+            return
+        
+        try:
+            recording_id = self.pending_recording_send['recording_id']
+            chat_info = self.pending_recording_send.get('chat_info')
+            
+            if not chat_info:
+                await event.reply("❌ Ошибка: информация о чате потеряна.")
+                return
+            
+            # Получаем информацию о пользователе
+            user_info = await self.get_user_info(user_input)
+            
+            if not user_info:
+                await event.reply("❌ Не удалось найти пользователя. Попробуйте еще раз.")
+                return
+            
+            # Сохраняем информацию о пользователе
+            self.pending_recording_send['target_user'] = user_info
+            
+            # Переходим к выбору режима отправки
+            await self.ask_send_mode(event, recording_id, chat_info, user_info)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки целевого пользователя: {e}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
+    
+    async def ask_send_mode(self, event, recording_id, chat_info, user_info):
+        """Спросить режим отправки"""
+        user_display = self.format_user_display(user_info)
+        
+        await event.edit(
+            f"✅ **Целевой пользователь:** {user_display}\n\n"
+            f"**Шаг 3: Режим отправки**\n\n"
+            f"**Вариант 1: Отслеживание сообщений**\n"
+            f"• Бот будет следить за сообщениями {user_display}\n"
+            f"• Отправит ваши сообщения, отвечая на его последнее сообщение\n"
+            f"• Если сообщение удалено, найдет другое\n\n"
+            f"**Вариант 2: Указать конкретное сообщение**\n"
+            f"• Отправьте ссылку на сообщение для ответа\n"
+            f"• Пример: `https://t.me/c/1234567890/123`\n\n"
+            f"**Вариант 3: Отправить как есть**\n"
+            f"• Просто отправит сообщения без ответа",
+            buttons=[
+                [Button.inline("👁️ Отслеживать сообщения", f"track_messages_{recording_id}_{chat_info['id']}_{user_info['id']}")],
+                [Button.inline("🔗 Указать сообщение", f"specify_message_{recording_id}_{chat_info['id']}")],
+                [Button.inline("📤 Отправить как есть", f"send_plain_{recording_id}_{chat_info['id']}")],
+                [Button.inline("↩️ Назад", b"recordings_menu")]
+            ]
+        )
+    
+    async def start_tracking_and_send(self, event, recording_id, chat_id, user_id):
+        """Начать отслеживание и отправить запись"""
+        recording = self.recordings.get(recording_id)
+        if not recording:
             await event.answer("❌ Запись не найдена!", alert=True)
             return
         
-        recording = self.recordings[recording_id]
-        messages = recording['messages']
+        await event.edit("🔍 **Ищу последнее сообщение пользователя...**")
         
-        if not messages:
-            await event.answer("❌ Запись пуста!", alert=True)
-            return
-        
-        # Определяем целевой чат
-        target_chat = None
-        target_message = None
-        
-        if chat_input:
-            try:
-                # Если это ID чата
-                if chat_input.startswith('-100'):
-                    target_chat = int(chat_input)
-                # Если это @username
-                elif chat_input.startswith('@'):
-                    entity = await self.user_client.get_entity(chat_input)
-                    target_chat = entity.id
-                # Если это ссылка на сообщение
-                elif 't.me/' in chat_input:
-                    # Парсим ссылку для ответа на сообщение
-                    parts = chat_input.split('/')
-                    if len(parts) >= 2:
-                        chat_part = parts[-2]
-                        msg_id = int(parts[-1])
-                        entity = await self.user_client.get_entity(chat_part)
-                        target_chat = entity.id
-                        target_message = msg_id
-                else:
-                    # Пробуем как числовой ID
-                    target_chat = int(chat_input)
-            except Exception as e:
-                await event.answer(f"❌ Ошибка: {str(e)}", alert=True)
-                return
-        else:
-            # Используем текущий чат
-            target_chat = event.chat_id
-        
-        # Спрашиваем про ответ на сообщение
-        if target_message:
-            await self.confirm_send_recording(event, recording_id, target_chat, target_message)
-        else:
-            await event.edit(
-                f"📨 **Отправка записи в чат ID:** `{target_chat}`\n\n"
-                "Хотите отвечать на конкретное сообщение?\n"
-                "Отправьте ссылку на сообщение или нажмите 'Отправить как есть'.",
-                buttons=[
-                    [Button.inline("📤 Отправить как есть", f"confirm_send_{recording_id}_{target_chat}_0")],
-                    [Button.inline("↩️ Отмена", b"recordings_menu")]
-                ]
-            )
+        try:
+            # Ищем последнее сообщение пользователя в чате
+            target_message = await self.find_user_message(chat_id, user_id)
+            
+            if target_message:
+                await self.confirm_send_with_tracking(event, recording_id, chat_id, user_id, target_message.id)
+            else:
+                await event.edit(
+                    "❌ **Сообщение не найдено!**\n\n"
+                    "Не удалось найти сообщения пользователя в этом чате.\n"
+                    "Выберите другой вариант отправки:",
+                    buttons=[
+                        [Button.inline("🔗 Указать сообщение вручную", f"specify_message_{recording_id}_{chat_id}")],
+                        [Button.inline("📤 Отправить как есть", f"send_plain_{recording_id}_{chat_id}")],
+                        [Button.inline("↩️ Отмена", b"recordings_menu")]
+                    ]
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка поиска сообщения: {e}")
+            await event.edit(f"❌ Ошибка поиска: {str(e)}")
     
-    async def confirm_send_recording(self, event, recording_id, chat_id, reply_to_msg_id=0):
-        """Подтверждение отправки записи"""
+    async def find_user_message(self, chat_id, user_id):
+        """Найти сообщение пользователя в чате"""
+        try:
+            # Ищем последние 50 сообщений
+            async for message in self.user_client.iter_messages(chat_id, limit=50):
+                if message.sender_id == user_id:
+                    return message
+            
+            # Если не нашли, ищем дальше
+            async for message in self.user_client.iter_messages(chat_id, limit=100, offset_id=0):
+                if message.sender_id == user_id:
+                    return message
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка поиска сообщения пользователя: {e}")
+            return None
+    
+    async def confirm_send_with_tracking(self, event, recording_id, chat_id, user_id, message_id):
+        """Подтверждение отправки с отслеживанием"""
         recording = self.recordings[recording_id]
         
         await event.edit(
-            f"✅ **Подтверждение отправки**\n\n"
+            f"✅ **Найдено сообщение для ответа!**\n\n"
             f"📝 Запись: {recording.get('name', 'Без названия')}\n"
             f"💬 Чат: `{chat_id}`\n"
+            f"👤 Пользователь: `{user_id}`\n"
+            f"📎 Ответ на сообщение: `{message_id}`\n"
             f"📊 Сообщений: {recording.get('message_count', 0)}\n"
             f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
-            f"{'📎 Будет ответом на сообщение' if reply_to_msg_id else '📤 Будет отправлено как новые сообщения'}",
+            f"**Бот будет:**\n"
+            f"1. Отправлять сообщения, отвечая на это сообщение\n"
+            f"2. Если сообщение удалено, искать другое сообщение пользователя\n"
+            f"3. Отправлять все сообщения с оригинальной скоростью",
             buttons=[
-                [Button.inline("🚀 Начать отправку", f"execute_send_{recording_id}_{chat_id}_{reply_to_msg_id}")],
+                [Button.inline("🚀 Начать отправку", f"execute_tracked_{recording_id}_{chat_id}_{user_id}_{message_id}")],
                 [Button.inline("↩️ Отмена", b"recordings_menu")]
             ]
         )
     
-    async def execute_recording_send(self, event, recording_id, chat_id, reply_to_msg_id=0):
-        """Выполнить отправку записи"""
+    async def execute_tracked_send(self, event, recording_id, chat_id, user_id, initial_message_id):
+        """Выполнить отправку с отслеживанием"""
         recording = self.recordings[recording_id]
         messages = recording['messages']
         
-        await event.edit("🚀 **Начинаю отправку записи...**\n\n0%")
+        await event.edit("🚀 **Начинаю отправку с отслеживанием...**\n\n0%")
+        
+        try:
+            sent_count = 0
+            start_time = time.time()
+            last_progress_update = start_time
+            
+            # Текущее сообщение для ответа
+            current_reply_to = initial_message_id
+            
+            for i, msg_data in enumerate(messages):
+                # Рассчитываем задержку для сохранения оригинальной скорости
+                if i > 0:
+                    time_diff = msg_data['time_offset'] - messages[i-1]['time_offset']
+                    if time_diff > 0:
+                        await asyncio.sleep(time_diff)
+                
+                # Пробуем отправить с текущим reply_to
+                try:
+                    sent_msg = await self.user_client.send_message(
+                        chat_id,
+                        msg_data['text'],
+                        reply_to=current_reply_to
+                    )
+                    sent_count += 1
+                    
+                except Exception as e:
+                    # Если ошибка из-за удаленного сообщения, ищем новое
+                    if "MESSAGE_ID_INVALID" in str(e) or "REPLY_MESSAGE_ID_INVALID" in str(e):
+                        logger.info(f"Сообщение {current_reply_to} удалено, ищу новое...")
+                        
+                        # Ищем новое сообщение пользователя
+                        new_message = await self.find_user_message(chat_id, user_id)
+                        
+                        if new_message:
+                            current_reply_to = new_message.id
+                            logger.info(f"Найдено новое сообщение: {current_reply_to}")
+                            
+                            # Пробуем отправить с новым reply_to
+                            try:
+                                sent_msg = await self.user_client.send_message(
+                                    chat_id,
+                                    msg_data['text'],
+                                    reply_to=current_reply_to
+                                )
+                                sent_count += 1
+                            except:
+                                # Если все равно ошибка, отправляем без ответа
+                                try:
+                                    sent_msg = await self.user_client.send_message(
+                                        chat_id,
+                                        msg_data['text']
+                                    )
+                                    sent_count += 1
+                                except:
+                                    logger.error(f"Не удалось отправить сообщение {i}")
+                        else:
+                            # Если не нашли сообщение, отправляем без ответа
+                            try:
+                                sent_msg = await self.user_client.send_message(
+                                    chat_id,
+                                    msg_data['text']
+                                )
+                                sent_count += 1
+                            except:
+                                logger.error(f"Не удалось отправить сообщение {i}")
+                    else:
+                        # Другая ошибка, пробуем отправить без ответа
+                        try:
+                            sent_msg = await self.user_client.send_message(
+                                chat_id,
+                                msg_data['text']
+                            )
+                            sent_count += 1
+                        except:
+                            logger.error(f"Не удалось отправить сообщение {i}")
+                
+                # Обновляем прогресс
+                progress = int((i + 1) / len(messages) * 100)
+                if progress % 25 == 0 or time.time() - last_progress_update > 2:
+                    await event.edit(f"🚀 **Отправка с отслеживанием...**\n\n{progress}%")
+                    last_progress_update = time.time()
+            
+            total_time = time.time() - start_time
+            original_time = messages[-1]['time_offset'] if messages else 0
+            
+            await event.edit(
+                f"✅ **Запись успешно отправлена с отслеживанием!**\n\n"
+                f"📊 Отправлено сообщений: **{sent_count}/{len(messages)}**\n"
+                f"⏱️ Оригинальное время: **{original_time:.1f}с**\n"
+                f"⏱️ Фактическое время: **{total_time:.1f}с**\n"
+                f"💬 Чат: `{chat_id}`\n"
+                f"👤 Отслеживаемый пользователь: `{user_id}`"
+            )
+            
+            logger.info(f"Запись {recording_id} отправлена в чат {chat_id} с отслеживанием пользователя {user_id}")
+            
+            # Сбрасываем ожидающую отправку
+            self.pending_recording_send = None
+            
+        except Exception as e:
+            await event.edit(f"❌ **Ошибка отправки:**\n\n{str(e)}")
+            logger.error(f"Ошибка отправки записи с отслеживанием: {e}")
+            self.pending_recording_send = None
+    
+    async def specify_message_link(self, event, recording_id, chat_id):
+        """Запрос ссылки на сообщение"""
+        await event.edit(
+            f"🔗 **Укажите ссылку на сообщение**\n\n"
+            f"Отправьте ссылку на сообщение, на которое нужно отвечать:\n"
+            f"Пример: `https://t.me/c/1234567890/123`\n\n"
+            f"Или нажмите кнопку для отправки как есть.",
+            buttons=[
+                [Button.inline("📤 Отправить как есть", f"send_plain_{recording_id}_{chat_id}")],
+                [Button.inline("↩️ Отмена", b"recordings_menu")]
+            ]
+        )
+        
+        # Обновляем ожидающую отправку
+        self.pending_recording_send = {
+            'recording_id': recording_id,
+            'chat_id': chat_id,
+            'step': 'message_link',
+            'event': event
+        }
+    
+    async def process_message_link(self, event, message_link):
+        """Обработка ссылки на сообщение"""
+        if not self.pending_recording_send:
+            return
+        
+        try:
+            recording_id = self.pending_recording_send['recording_id']
+            chat_id = self.pending_recording_send['chat_id']
+            
+            # Парсим ссылку
+            message_id = self.parse_message_link(message_link)
+            
+            if not message_id:
+                await event.reply("❌ Неверный формат ссылки. Пример: https://t.me/c/1234567890/123")
+                return
+            
+            await self.confirm_send_with_message(event, recording_id, chat_id, message_id)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки ссылки: {e}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
+    
+    def parse_message_link(self, link):
+        """Парсинг ссылки на сообщение"""
+        try:
+            # Убираем пробелы
+            link = link.strip()
+            
+            # Парсим разные форматы ссылок
+            patterns = [
+                r't\.me/c/(\d+)/(\d+)',  # t.me/c/1234567890/123
+                r't\.me/(\w+)/(\d+)',    # t.me/username/123
+                r'tg://openmessage\?chat_id=(-?\d+)&message_id=(\d+)'  # tg://openmessage
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, link)
+                if match:
+                    return int(match.group(2))  # Возвращаем ID сообщения
+            
+            return None
+            
+        except:
+            return None
+    
+    async def confirm_send_with_message(self, event, recording_id, chat_id, message_id):
+        """Подтверждение отправки с указанным сообщением"""
+        recording = self.recordings[recording_id]
+        
+        await event.edit(
+            f"✅ **Сообщение для ответа определено!**\n\n"
+            f"📝 Запись: {recording.get('name', 'Без названия')}\n"
+            f"💬 Чат: `{chat_id}`\n"
+            f"📎 Ответ на сообщение: `{message_id}`\n"
+            f"📊 Сообщений: {recording.get('message_count', 0)}\n"
+            f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с",
+            buttons=[
+                [Button.inline("🚀 Начать отправку", f"execute_with_message_{recording_id}_{chat_id}_{message_id}")],
+                [Button.inline("↩️ Отмена", b"recordings_menu")]
+            ]
+        )
+    
+    async def execute_with_message_send(self, event, recording_id, chat_id, message_id):
+        """Выполнить отправку с указанным сообщением"""
+        recording = self.recordings[recording_id]
+        messages = recording['messages']
+        
+        await event.edit("🚀 **Начинаю отправку...**\n\n0%")
         
         try:
             sent_count = 0
@@ -686,12 +1036,12 @@ class BotInterface:
                 
                 # Отправляем сообщение
                 try:
-                    if reply_to_msg_id and i == 0:
+                    if i == 0:
                         # Первое сообщение как реплай
                         sent_msg = await self.user_client.send_message(
                             chat_id,
                             msg_data['text'],
-                            reply_to=reply_to_msg_id
+                            reply_to=message_id
                         )
                     else:
                         # Остальные как обычные сообщения
@@ -702,16 +1052,99 @@ class BotInterface:
                     
                     sent_count += 1
                     
-                    # Обновляем прогресс каждые 25% или 2 секунды
-                    current_time = time.time()
-                    progress = int((i + 1) / len(messages) * 100)
-                    
-                    if progress % 25 == 0 or current_time - last_progress_update > 2:
-                        await event.edit(f"🚀 **Отправка записи...**\n\n{progress}%")
-                        last_progress_update = current_time
-                
                 except Exception as e:
-                    logger.error(f"Ошибка отправки сообщения {i}: {e}")
+                    # Если ошибка с reply_to, отправляем без него
+                    if i == 0 and ("MESSAGE_ID_INVALID" in str(e) or "REPLY_MESSAGE_ID_INVALID" in str(e)):
+                        try:
+                            sent_msg = await self.user_client.send_message(
+                                chat_id,
+                                msg_data['text']
+                            )
+                            sent_count += 1
+                        except:
+                            logger.error(f"Не удалось отправить сообщение {i}")
+                    else:
+                        logger.error(f"Не удалось отправить сообщение {i}")
+                
+                # Обновляем прогресс
+                progress = int((i + 1) / len(messages) * 100)
+                if progress % 25 == 0 or time.time() - last_progress_update > 2:
+                    await event.edit(f"🚀 **Отправка записи...**\n\n{progress}%")
+                    last_progress_update = time.time()
+            
+            total_time = time.time() - start_time
+            original_time = messages[-1]['time_offset'] if messages else 0
+            
+            await event.edit(
+                f"✅ **Запись успешно отправлена!**\n\n"
+                f"📊 Отправлено сообщений: **{sent_count}/{len(messages)}**\n"
+                f"⏱️ Оригинальное время: **{original_time:.1f}с**\n"
+                f"⏱️ Фактическое время: **{total_time:.1f}с**\n"
+                f"💬 Чат: `{chat_id}`\n"
+                f"📎 Ответ на сообщение: `{message_id}`"
+            )
+            
+            logger.info(f"Запись {recording_id} отправлена в чат {chat_id} с ответом на {message_id}")
+            
+            # Сбрасываем ожидающую отправку
+            self.pending_recording_send = None
+            
+        except Exception as e:
+            await event.edit(f"❌ **Ошибка отправки:**\n\n{str(e)}")
+            logger.error(f"Ошибка отправки записи: {e}")
+            self.pending_recording_send = None
+    
+    async def send_plain_recording(self, event, recording_id, chat_id):
+        """Отправить запись без ответа"""
+        recording = self.recordings[recording_id]
+        
+        await event.edit(
+            f"✅ **Отправка записи как есть**\n\n"
+            f"📝 Запись: {recording.get('name', 'Без названия')}\n"
+            f"💬 Чат: `{chat_id}`\n"
+            f"📊 Сообщений: {recording.get('message_count', 0)}\n"
+            f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
+            f"Сообщения будут отправлены без ответа на другие сообщения.",
+            buttons=[
+                [Button.inline("🚀 Начать отправку", f"execute_plain_{recording_id}_{chat_id}")],
+                [Button.inline("↩️ Отмена", b"recordings_menu")]
+            ]
+        )
+    
+    async def execute_plain_send(self, event, recording_id, chat_id):
+        """Выполнить отправку без ответа"""
+        recording = self.recordings[recording_id]
+        messages = recording['messages']
+        
+        await event.edit("🚀 **Начинаю отправку...**\n\n0%")
+        
+        try:
+            sent_count = 0
+            start_time = time.time()
+            last_progress_update = start_time
+            
+            for i, msg_data in enumerate(messages):
+                # Рассчитываем задержку для сохранения оригинальной скорости
+                if i > 0:
+                    time_diff = msg_data['time_offset'] - messages[i-1]['time_offset']
+                    if time_diff > 0:
+                        await asyncio.sleep(time_diff)
+                
+                # Отправляем сообщение
+                try:
+                    sent_msg = await self.user_client.send_message(
+                        chat_id,
+                        msg_data['text']
+                    )
+                    sent_count += 1
+                except Exception as e:
+                    logger.error(f"Не удалось отправить сообщение {i}: {e}")
+                
+                # Обновляем прогресс
+                progress = int((i + 1) / len(messages) * 100)
+                if progress % 25 == 0 or time.time() - last_progress_update > 2:
+                    await event.edit(f"🚀 **Отправка записи...**\n\n{progress}%")
+                    last_progress_update = time.time()
             
             total_time = time.time() - start_time
             original_time = messages[-1]['time_offset'] if messages else 0
@@ -724,11 +1157,15 @@ class BotInterface:
                 f"💬 Чат: `{chat_id}`"
             )
             
-            logger.info(f"Запись {recording_id} отправлена в чат {chat_id} ({sent_count} сообщений)")
+            logger.info(f"Запись {recording_id} отправлена в чат {chat_id} без ответа")
+            
+            # Сбрасываем ожидающую отправку
+            self.pending_recording_send = None
             
         except Exception as e:
             await event.edit(f"❌ **Ошибка отправки:**\n\n{str(e)}")
             logger.error(f"Ошибка отправки записи: {e}")
+            self.pending_recording_send = None
     
     async def handle_add_command(self, event):
         """Обработка команды добавления"""
@@ -965,6 +1402,7 @@ class BotInterface:
         3. Бот записывает текст и время
         4. Используйте /stop для сохранения
         5. Воспроизводите записи в любом чате
+        6. **Можно следить за сообщениями врага и отвечать на них**
         """
         
         buttons = [
@@ -1080,27 +1518,66 @@ class BotInterface:
                 recording_id = data.replace('play_recording_', '')
                 await self.play_recording(event, recording_id)
             
-            elif data.startswith('send_recording_'):
-                # Формат: send_recording_{id}_here
-                parts = data.split('_')
-                recording_id = f"{parts[2]}_{parts[3]}" if len(parts) > 3 else parts[2]
-                await self.send_recording_to_chat(event, recording_id)
+            elif data.startswith('send_here_'):
+                # Формат: send_here_{recording_id}
+                recording_id = data.replace('send_here_', '')
+                chat_id = event.chat_id
+                
+                # Переходим к выбору пользователя для отслеживания
+                await self.ask_target_user(event, recording_id, {'id': chat_id, 'title': 'Текущий чат'})
             
-            elif data.startswith('confirm_send_'):
-                # Формат: confirm_send_{id}_{chat}_{reply}
+            elif data.startswith('no_tracking_'):
+                # Формат: no_tracking_{recording_id}_{chat_id}
                 parts = data.split('_')
                 recording_id = f"{parts[2]}_{parts[3]}"
                 chat_id = int(parts[4])
-                reply_id = int(parts[5]) if len(parts) > 5 else 0
-                await self.confirm_send_recording(event, recording_id, chat_id, reply_id)
+                await self.send_plain_recording(event, recording_id, chat_id)
             
-            elif data.startswith('execute_send_'):
-                # Формат: execute_send_{id}_{chat}_{reply}
+            elif data.startswith('track_messages_'):
+                # Формат: track_messages_{recording_id}_{chat_id}_{user_id}
                 parts = data.split('_')
                 recording_id = f"{parts[2]}_{parts[3]}"
                 chat_id = int(parts[4])
-                reply_id = int(parts[5]) if len(parts) > 5 else 0
-                await self.execute_recording_send(event, recording_id, chat_id, reply_id)
+                user_id = int(parts[5])
+                await self.start_tracking_and_send(event, recording_id, chat_id, user_id)
+            
+            elif data.startswith('specify_message_'):
+                # Формат: specify_message_{recording_id}_{chat_id}
+                parts = data.split('_')
+                recording_id = f"{parts[2]}_{parts[3]}"
+                chat_id = int(parts[4])
+                await self.specify_message_link(event, recording_id, chat_id)
+            
+            elif data.startswith('send_plain_'):
+                # Формат: send_plain_{recording_id}_{chat_id}
+                parts = data.split('_')
+                recording_id = f"{parts[2]}_{parts[3]}"
+                chat_id = int(parts[4])
+                await self.send_plain_recording(event, recording_id, chat_id)
+            
+            elif data.startswith('execute_tracked_'):
+                # Формат: execute_tracked_{recording_id}_{chat_id}_{user_id}_{message_id}
+                parts = data.split('_')
+                recording_id = f"{parts[2]}_{parts[3]}"
+                chat_id = int(parts[4])
+                user_id = int(parts[5])
+                message_id = int(parts[6])
+                await self.execute_tracked_send(event, recording_id, chat_id, user_id, message_id)
+            
+            elif data.startswith('execute_with_message_'):
+                # Формат: execute_with_message_{recording_id}_{chat_id}_{message_id}
+                parts = data.split('_')
+                recording_id = f"{parts[2]}_{parts[3]}"
+                chat_id = int(parts[4])
+                message_id = int(parts[5])
+                await self.execute_with_message_send(event, recording_id, chat_id, message_id)
+            
+            elif data.startswith('execute_plain_'):
+                # Формат: execute_plain_{recording_id}_{chat_id}
+                parts = data.split('_')
+                recording_id = f"{parts[2]}_{parts[3]}"
+                chat_id = int(parts[4])
+                await self.execute_plain_send(event, recording_id, chat_id)
             
             elif data == 'add_user_menu':
                 await event.edit(
@@ -1266,6 +1743,7 @@ class BotInterface:
             f"📝 **Сохранено записей:** {len(self.recordings)}\n"
             f"⚡ **Режим:** {'Активный мониторинг' if self.active_monitoring else 'Приостановлен'}\n\n"
             f"⚠️ **Уведомления об удалении:** {'Включены' if self.config['delete_notifications'] else 'Отключены'}\n\n"
+            f"🎬 **Новая функция:** Отправка записей с отслеживанием сообщений врага!\n\n"
             f"📋 **Используйте /menu для управления**"
         )
         
@@ -1289,6 +1767,8 @@ async def main():
     print("• 🗑️ Удаление ВСЕХ сообщений в цепочке")
     print("• 🎬 Запись сообщений с оригинальной скоростью")
     print("• 📨 Воспроизведение записей в любом чате")
+    print("• 👁️ Отслеживание сообщений врага")
+    print("• 🔄 Автопоиск сообщений если удалено")
     print("• 🔕 Уведомления об удалении отключены")
     print("=" * 60)
     print("🚀 Запуск...")
