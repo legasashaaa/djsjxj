@@ -654,13 +654,14 @@ class BotInterface:
             # Пробуем получить информацию о чате
             try:
                 entity = await self.user_client.get_entity(chat_input)
+                chat_title = getattr(entity, 'title', getattr(entity, 'first_name', ''))
                 return {
                     'id': entity.id,
                     'type': 'channel' if hasattr(entity, 'broadcast') else 
                             'chat' if hasattr(entity, 'megagroup') else 
                             'user',
                     'username': getattr(entity, 'username', None),
-                    'title': getattr(entity, 'title', getattr(entity, 'first_name', '')),
+                    'title': chat_title,
                     'access_hash': getattr(entity, 'access_hash', None)
                 }
             except:
@@ -669,9 +670,9 @@ class BotInterface:
                     chat_id = int(chat_input)
                     # Для ID без @ нужно использовать специальные методы
                     if chat_id < 0:  # Группа/канал
-                        return {'id': chat_id, 'type': 'channel'}
+                        return {'id': chat_id, 'type': 'channel', 'title': f'ID: {chat_id}'}
                     else:  # Пользователь
-                        return {'id': chat_id, 'type': 'user'}
+                        return {'id': chat_id, 'type': 'user', 'title': f'ID: {chat_id}'}
                 except:
                     return None
             
@@ -681,8 +682,10 @@ class BotInterface:
     
     async def ask_target_user(self, event, recording_id, chat_info):
         """Спросить пользователя, за кем следить"""
+        chat_title = chat_info.get('title', f'ID: {chat_info["id"]}')
+        
         await event.edit(
-            f"✅ **Чат определен:** {chat_info.get('title', f'ID: {chat_info[\"id\"]}')}\n\n"
+            f"✅ **Чат определен:** {chat_title}\n\n"
             f"**Шаг 2: За кем следить?**\n"
             f"Введите username или ID пользователя, за сообщениями которого нужно следить:\n"
             f"Примеры:\n"
