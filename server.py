@@ -59,6 +59,9 @@ class BotInterface:
         self.config = self.load_config()
         self.recordings = self.load_recordings()
         
+        # Восстанавливаем правильные задержки для старых записей
+        self.fix_old_recordings()
+        
         # Создаем клиент для бота
         self.bot = TelegramClient(
             'bot_session',
@@ -125,11 +128,70 @@ class BotInterface:
         try:
             if os.path.exists(RECORDINGS_FILE):
                 with open(RECORDINGS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    recordings = json.load(f)
+                    
+                    # Конвертируем старый формат в новый
+                    return self.convert_old_recordings(recordings)
         except Exception as e:
             logger.error(f"Ошибка загрузки записей: {e}")
         
         return {}
+    
+    def convert_old_recordings(self, recordings):
+        """Конвертация старых записей в новый формат"""
+        converted = {}
+        
+        for rec_id, recording in recordings.items():
+            # Проверяем, есть ли поле messages
+            if 'messages' not in recording:
+                continue
+                
+            messages = recording['messages']
+            
+            # Если это старый формат без delay_since_last
+            if messages and len(messages) > 0 and 'delay_since_last' not in messages[0]:
+                logger.info(f"Конвертируем старую запись: {rec_id}")
+                
+                # Пересчитываем задержки
+                for i, msg in enumerate(messages):
+                    if i == 0:
+                        msg['delay_since_last'] = 0.0
+                    else:
+                        # Вычисляем разницу во времени между сообщениями
+                        time_diff = msg['time_offset'] - messages[i-1]['time_offset']
+                        msg['delay_since_last'] = max(0.0, time_diff)  # Убедимся, что не отрицательное
+                
+                recording['messages'] = messages
+                recording['message_count'] = len(messages)
+            
+            converted[rec_id] = recording
+        
+        return converted
+    
+    def fix_old_recordings(self):
+        """Исправление старых записей при загрузке"""
+        for rec_id, recording in self.recordings.items():
+            if 'messages' in recording:
+                messages = recording['messages']
+                
+                # Проверяем и исправляем каждое сообщение
+                for i, msg in enumerate(messages):
+                    # Убедимся, что все необходимые поля есть
+                    if 'delay_since_last' not in msg:
+                        msg['delay_since_last'] = 0.0
+                    
+                    # Исправляем отрицательные задержки
+                    if msg['delay_since_last'] < 0:
+                        msg['delay_since_last'] = 0.0
+                    
+                    # Исправляем слишком большие задержки (больше 60 секунд)
+                    if msg['delay_since_last'] > 60:
+                        msg['delay_since_last'] = 1.0  # Устанавливаем разумную задержку
+                
+                recording['messages'] = messages
+        
+        # Сохраняем исправленные записи
+        self.save_recordings()
     
     def save_config(self):
         """Сохранение конфигурации"""
@@ -143,7 +205,16 @@ class BotInterface:
         """Сохранение записей"""
         try:
             with open(RECORDINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.recordings, f, ensure_ascii=False, indent=2)
+                # Убедимся, что все записи в правильном формате
+                clean_recordings = {}
+                for rec_id, recording in self.recordings.items():
+                    clean_recording = recording.copy()
+                    # Удаляем временные поля
+                    if 'temp' in clean_recording:
+                        del clean_recording['temp']
+                    clean_recordings[rec_id] = clean_recording
+                
+                json.dump(clean_recordings, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"Ошибка сохранения записей: {e}")
     
@@ -293,8 +364,8 @@ class BotInterface:
             # Сохраняем данные сообщения
             message_data = {
                 'timestamp': current_time,
-                'time_offset': time_offset,
-                'delay_since_last': delay_since_last,
+                'time_offset': round(time_offset, 3),  # Округляем до миллисекунд
+                'delay_since_last': round(delay_since_last, 3),  # Округляем до миллисекунд
                 'text': event.message.text or '',
                 'chat_id': event.chat_id,
                 'message_id': event.message.id
@@ -309,7 +380,7 @@ class BotInterface:
             self.last_message_time = current_time
             
             # Логируем
-            logger.info(f"📝 Запись: сохранено сообщение в {time_offset:.2f}с (задержка: {delay_since_last:.2f}с)")
+            logger.info(f"📝 Запись: сохранено сообщение в {time_offset:.3f}с (задержка: {delay_since_last:.3f}с)")
             
         except Exception as e:
             logger.error(f"Ошибка сохранения в запись: {e}")
@@ -415,7 +486,7 @@ class BotInterface:
                     await msg.delete()
                     deleted_count += 1
                     
-                    # Обновляем статистики
+                    # Обновляем статистику
                     self.deletion_stats['total_deleted'] += 1
                     self.deletion_stats['deleted_today'] += 1
                     
@@ -528,15 +599,19 @@ class BotInterface:
             await event.reply("❌ Запись пуста!")
             return
         
+        # Проверяем и корректируем задержки перед сохранением
+        self.fix_recording_delays()
+        
         # Сохраняем запись
         recording_id = f"recording_{int(time.time())}"
         self.recordings[recording_id] = {
             'id': recording_id,
             'name': f"Запись от {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            'messages': self.current_recording,
+            'messages': self.current_recording.copy(),  # Используем копию
             'created_at': time.time(),
             'chat_id': self.current_recording_chat,
-            'message_count': len(self.current_recording)
+            'message_count': len(self.current_recording),
+            'total_duration': self.current_recording[-1]['time_offset'] if self.current_recording else 0
         }
         
         self.save_recordings()
@@ -553,10 +628,25 @@ class BotInterface:
             f"✅ **Запись сохранена!**\n\n"
             f"📝 ID записи: `{recording_id}`\n"
             f"📊 Сообщений записано: **{len(recording_data)}**\n"
-            f"⏱️ Длительность: **{recording_data[-1]['time_offset']:.1f} секунд**\n\n"
+            f"⏱️ Длительность: **{recording_data[-1]['time_offset']:.3f} секунд**\n\n"
             f"Используйте /recordings для управления записями."
         )
         logger.info(f"Запись сохранена: {recording_id} ({len(recording_data)} сообщений)")
+    
+    def fix_recording_delays(self):
+        """Исправление задержек в текущей записи"""
+        if not self.current_recording:
+            return
+        
+        # Пересчитываем задержки для надежности
+        for i, msg in enumerate(self.current_recording):
+            if i == 0:
+                msg['delay_since_last'] = 0.0
+            else:
+                # Вычисляем разницу во времени между сообщениями
+                time_diff = msg['time_offset'] - self.current_recording[i-1]['time_offset']
+                # Убедимся, что задержка не отрицательная и не слишком большая
+                msg['delay_since_last'] = max(0.0, min(time_diff, 60.0))
     
     async def show_recordings_menu(self, event):
         """Показать меню записей"""
@@ -585,9 +675,10 @@ class BotInterface:
             rec_name = recording.get('name', f"Запись {rec_id[:8]}")
             msg_count = recording.get('message_count', len(recording.get('messages', [])))
             created_time = datetime.fromtimestamp(recording['created_at']).strftime('%d.%m %H:%M')
+            duration = recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0)
             
             text_line = f"• **{rec_name}**\n"
-            text_line += f"  📊 {msg_count} сообщ., 📅 {created_time}\n"
+            text_line += f"  📊 {msg_count} сообщ., ⏱️ {duration:.1f}с, 📅 {created_time}\n"
             text += text_line
             
             buttons.append([Button.inline(f"▶️ {rec_name[:30]}", f"play_recording_{rec_id}")])
@@ -605,11 +696,14 @@ class BotInterface:
         
         recording = self.recordings[recording_id]
         
+        # Проверяем и исправляем запись перед воспроизведением
+        self.check_and_fix_recording(recording)
+        
         try:
             await event.edit(
                 f"▶️ **Воспроизведение записи:** {recording.get('name', 'Без названия')}\n\n"
                 f"📊 Сообщений: {recording.get('message_count', 0)}\n"
-                f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
+                f"⏱️ Длительность: {recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0):.3f}с\n\n"
                 "**Шаг 1: Куда отправить запись?**\n"
                 "Отправьте ID чата или username:\n"
                 "Примеры:\n"
@@ -633,6 +727,55 @@ class BotInterface:
             'step': 'chat_input',
             'event': event
         }
+    
+    def check_and_fix_recording(self, recording):
+        """Проверить и исправить запись перед воспроизведением"""
+        if 'messages' not in recording:
+            return
+        
+        messages = recording['messages']
+        needs_fix = False
+        
+        for i, msg in enumerate(messages):
+            # Проверяем наличие всех необходимых полей
+            if 'delay_since_last' not in msg:
+                msg['delay_since_last'] = 0.0
+                needs_fix = True
+            
+            if 'time_offset' not in msg:
+                # Если нет time_offset, создаем его из delay_since_last
+                if i == 0:
+                    msg['time_offset'] = 0.0
+                else:
+                    msg['time_offset'] = messages[i-1]['time_offset'] + msg.get('delay_since_last', 0.0)
+                needs_fix = True
+            
+            # Исправляем отрицательные или слишком большие задержки
+            if msg['delay_since_last'] < 0:
+                msg['delay_since_last'] = 0.0
+                needs_fix = True
+            
+            if msg['delay_since_last'] > 60:
+                msg['delay_since_last'] = 1.0
+                needs_fix = True
+        
+        if needs_fix:
+            # Пересчитываем time_offset на основе delay_since_last
+            total_time = 0.0
+            for i, msg in enumerate(messages):
+                if i == 0:
+                    msg['time_offset'] = 0.0
+                else:
+                    total_time += msg['delay_since_last']
+                    msg['time_offset'] = total_time
+            
+            # Обновляем запись
+            recording['messages'] = messages
+            recording['total_duration'] = total_time if messages else 0.0
+            
+            # Сохраняем исправленную запись
+            self.save_recordings()
+            logger.info(f"Исправлена запись: {recording.get('name', 'Без названия')}")
     
     async def handle_chat_input(self, event):
         """Обработка ввода чата для отправки записи"""
@@ -933,7 +1076,7 @@ class BotInterface:
                 f"👤 Пользователь: {user_display}\n"
                 f"📎 Ответ на сообщение: `{message_id}`\n"
                 f"📊 Сообщений: {recording.get('message_count', 0)}\n"
-                f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
+                f"⏱️ Длительность: {recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0):.3f}с\n\n"
                 f"**Бот будет:**\n"
                 f"1. Отправлять сообщения, отвечая на это сообщение\n"
                 f"2. Если сообщение удалено, найдет предыдущее или следующее\n"
@@ -961,7 +1104,7 @@ class BotInterface:
                 f"👤 Пользователь: {user_display}\n"
                 f"📎 Ответ на сообщение: `{message_id}`\n"
                 f"📊 Сообщений: {recording.get('message_count', 0)}\n"
-                f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
+                f"⏱️ Длительность: {recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0):.3f}с\n\n"
                 f"**Бот будет:**\n"
                 f"1. Отправить все сообщения, отвечая на это сообщение\n"
                 f"2. Если сообщение удалено, найдет предыдущее или следующее\n"
@@ -981,6 +1124,9 @@ class BotInterface:
         recording = self.recordings[recording_id]
         messages = recording['messages']
         
+        # Проверяем запись перед отправкой
+        self.check_and_fix_recording(recording)
+        
         try:
             await event.edit("🚀 **Начинаю отправку с отслеживанием...**\n\n⏳ 0% (0/{})".format(len(messages)))
         except:
@@ -998,8 +1144,11 @@ class BotInterface:
             
             for i, msg_data in enumerate(messages):
                 # Рассчитываем задержку для сохранения оригинальной скорости
-                if i > 0 and msg_data.get('delay_since_last', 0) > 0:
-                    await asyncio.sleep(msg_data['delay_since_last'])
+                delay = msg_data.get('delay_since_last', 0.0)
+                if delay > 0:
+                    # Логируем задержку
+                    logger.info(f"Задержка {i}: {delay:.3f} секунд")
+                    await asyncio.sleep(delay)
                 
                 # Пробуем отправить с текущим reply_to
                 try:
@@ -1074,14 +1223,14 @@ class BotInterface:
                     last_progress_update = current_time
             
             total_time = time.time() - start_time
-            original_time = messages[-1]['time_offset'] if messages else 0
+            original_time = recording.get('total_duration', messages[-1]['time_offset'] if messages else 0)
             
             try:
                 await event.edit(
                     f"✅ **Запись успешно отправлена с отслеживанием!**\n\n"
                     f"📊 Отправлено сообщений: **{sent_count}/{len(messages)}**\n"
-                    f"⏱️ Оригинальное время: **{original_time:.1f}с**\n"
-                    f"⏱️ Фактическое время: **{total_time:.1f}с**\n"
+                    f"⏱️ Оригинальное время: **{original_time:.3f}с**\n"
+                    f"⏱️ Фактическое время: **{total_time:.3f}с**\n"
                     f"💬 Чат: `{chat_id}`\n"
                     f"👤 Отслеживаемый пользователь: `{user_id}`\n"
                     f"🔄 Найдено новых сообщений: **{failed_attempts}**"
@@ -1107,6 +1256,9 @@ class BotInterface:
         recording = self.recordings[recording_id]
         messages = recording['messages']
         
+        # Проверяем запись перед отправкой
+        self.check_and_fix_recording(recording)
+        
         try:
             await event.edit("🚀 **Начинаю отправку с ответом...**\n\n⏳ 0% (0/{})".format(len(messages)))
         except:
@@ -1124,8 +1276,9 @@ class BotInterface:
             
             for i, msg_data in enumerate(messages):
                 # Рассчитываем задержку для сохранения оригинальной скорости
-                if i > 0 and msg_data.get('delay_since_last', 0) > 0:
-                    await asyncio.sleep(msg_data['delay_since_last'])
+                delay = msg_data.get('delay_since_last', 0.0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 
                 # Отправляем сообщение
                 try:
@@ -1210,14 +1363,14 @@ class BotInterface:
                     last_progress_update = current_time
             
             total_time = time.time() - start_time
-            original_time = messages[-1]['time_offset'] if messages else 0
+            original_time = recording.get('total_duration', messages[-1]['time_offset'] if messages else 0)
             
             try:
                 await event.edit(
                     f"✅ **Запись успешно отправлена!**\n\n"
                     f"📊 Отправлено сообщений: **{sent_count}/{len(messages)}**\n"
-                    f"⏱️ Оригинальное время: **{original_time:.1f}с**\n"
-                    f"⏱️ Фактическое время: **{total_time:.1f}с**\n"
+                    f"⏱️ Оригинальное время: **{original_time:.3f}с**\n"
+                    f"⏱️ Фактическое время: **{total_time:.3f}с**\n"
                     f"💬 Чат: `{chat_id}`\n"
                     f"📎 Ответ на сообщение: `{initial_message_id}`"
                 )
@@ -1247,7 +1400,7 @@ class BotInterface:
                 f"📝 Запись: {recording.get('name', 'Без названия')}\n"
                 f"💬 Чат: `{chat_id}`\n"
                 f"📊 Сообщений: {recording.get('message_count', 0)}\n"
-                f"⏱️ Длительность: {recording['messages'][-1]['time_offset']:.1f}с\n\n"
+                f"⏱️ Длительность: {recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0):.3f}с\n\n"
                 f"Сообщения будут отправлены без ответа на другие сообщения.",
                 buttons=[
                     [Button.inline("🚀 Начать отправку", f"execute_plain_{recording_id}_{chat_id}")],
@@ -1263,6 +1416,9 @@ class BotInterface:
         recording = self.recordings[recording_id]
         messages = recording['messages']
         
+        # Проверяем запись перед отправкой
+        self.check_and_fix_recording(recording)
+        
         try:
             await event.edit("🚀 **Начинаю отправку...**\n\n⏳ 0% (0/{})".format(len(messages)))
         except:
@@ -1275,8 +1431,9 @@ class BotInterface:
             
             for i, msg_data in enumerate(messages):
                 # Рассчитываем задержку для сохранения оригинальной скорости
-                if i > 0 and msg_data.get('delay_since_last', 0) > 0:
-                    await asyncio.sleep(msg_data['delay_since_last'])
+                delay = msg_data.get('delay_since_last', 0.0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 
                 # Отправляем сообщение
                 try:
@@ -1300,14 +1457,14 @@ class BotInterface:
                     last_progress_update = current_time
             
             total_time = time.time() - start_time
-            original_time = messages[-1]['time_offset'] if messages else 0
+            original_time = recording.get('total_duration', messages[-1]['time_offset'] if messages else 0)
             
             try:
                 await event.edit(
                     f"✅ **Запись успешно отправлена!**\n\n"
                     f"📊 Отправлено сообщений: **{sent_count}/{len(messages)}**\n"
-                    f"⏱️ Оригинальное время: **{original_time:.1f}с**\n"
-                    f"⏱️ Фактическое время: **{total_time:.1f}с**\n"
+                    f"⏱️ Оригинальное время: **{original_time:.3f}с**\n"
+                    f"⏱️ Фактическое время: **{total_time:.3f}с**\n"
                     f"💬 Чат: `{chat_id}`"
                 )
             except:
@@ -1563,6 +1720,7 @@ class BotInterface:
         5. Воспроизводите записи в любом чате
         6. **Можно следить за сообщениями врага и отвечать на них**
         7. **Если враг удалил сообщение, бот найдет его предыдущее или следующее**
+        8. **Сохраняются точные паузы между сообщениями**
         """
         
         buttons = [
@@ -1892,13 +2050,14 @@ class BotInterface:
             f"👤 **Владелец:** {OWNER_ID}\n"
             f"👥 **Пользователей в черном списке:** {len(self.config['blacklist'])}\n"
             f"💬 **Мониторинг чатов:** {'🌐 Все чаты' if self.config['enabled_for_all'] else f'💬 {len(self.config['enabled_chats'])} чатов'}\n"
-            f"📝 **Сохранено записей:** {len(self.recordings)}\n"
+            f"📝 **Сохранено записей:** {len(self.recordings)} ({self.count_messages_in_recordings()} сообщений)\n"
             f"⚡ **Режим:** {'Активный мониторинг' if self.active_monitoring else 'Приостановлен'}\n\n"
             f"⚠️ **Уведомления об удалении:** {'Включены' if self.config['delete_notifications'] else 'Отключены'}\n\n"
             f"🎬 **Новые функции:**\n"
             f"• 📨 Отправка записей с отслеживанием сообщений врага!\n"
             f"• 🔄 Автопоиск сообщений если враг удалил сообщение\n"
-            f"• ⏱️ Точное сохранение скорости и пауз\n\n"
+            f"• ⏱️ Точное сохранение скорости и пауз\n"
+            f"• 🔧 Исправление старых записей\n\n"
             f"📋 **Используйте /menu для управления**"
         )
         
@@ -1906,6 +2065,13 @@ class BotInterface:
             await self.bot.send_message(OWNER_ID, welcome_text, parse_mode='md')
         except:
             pass
+    
+    def count_messages_in_recordings(self):
+        """Подсчитать общее количество сообщений во всех записях"""
+        total = 0
+        for recording in self.recordings.values():
+            total += len(recording.get('messages', []))
+        return total
 
 
 # Запуск бота
@@ -1925,7 +2091,9 @@ async def main():
     print("• 👁️ Отслеживание сообщений врага")
     print("• 📨 Ответ на последнее сообщение пользователя")
     print("• 🔄 Автопоиск ПРЕДЫДУЩЕГО или СЛЕДУЮЩЕГО сообщения если удалено")
-    print("• ⏱️ Точное сохранение оригинальной скорости")
+    print("• ⏱️ Точное сохранение оригинальной скорости (миллисекунды)")
+    print("• 🔧 Автоматическое исправление старых записей")
+    print("• 💾 Сохранение записей между перезагрузками")
     print("• 🔕 Уведомления об удалении отключены")
     print("=" * 60)
     print("🚀 Запуск...")
