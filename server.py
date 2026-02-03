@@ -42,6 +42,7 @@ class BotInterface:
         self.current_recording = []  # Текущая запись
         self.current_recording_chat = None  # Чат текущей записи
         self.pending_recording_send = None  # Ожидающая отправка записи
+        self.pending_deletion = None  # Ожидающая удаление записи
         self.deletion_stats = {
             'total_deleted': 0,
             'deleted_today': 0,
@@ -295,6 +296,12 @@ class BotInterface:
             if event.sender_id == OWNER_ID:
                 await self.show_recordings_menu(event)
         
+        @self.bot.on(events.NewMessage(pattern='/delete_recording'))
+        async def delete_recording_handler(event):
+            """Обработчик команды /delete_recording - удалить запись"""
+            if event.sender_id == OWNER_ID:
+                await self.show_delete_recordings_menu(event)
+        
         # Обработчик ввода ID чата для отправки записи
         @self.bot.on(events.NewMessage)
         async def chat_input_handler(event):
@@ -306,6 +313,13 @@ class BotInterface:
                     await self.process_target_user(event)
                 elif self.pending_recording_send.get('step') == 'message_link':
                     await self.process_message_link(event, event.message.text)
+        
+        # Обработчик ввода номера записи для удаления
+        @self.bot.on(events.NewMessage)
+        async def delete_input_handler(event):
+            """Обработка ввода номера записи для удаления"""
+            if event.sender_id == OWNER_ID and self.pending_deletion:
+                await self.handle_delete_input(event)
         
         # Обработчик пересланных сообщений для добавления пользователей
         @self.bot.on(events.NewMessage)
@@ -344,7 +358,7 @@ class BotInterface:
         """Сохранение сообщения в текущую запись"""
         try:
             # Пропускаем служебные команды
-            if event.message.text in ['/record', '/stop', '/recordings']:
+            if event.message.text in ['/record', '/stop', '/recordings', '/delete_recording']:
                 return
             
             # Получаем текущее время
@@ -550,7 +564,8 @@ class BotInterface:
             [Button.inline("📊 Статистика", b"stats_menu"),
              Button.inline("⚙️ Настройки", b"settings_menu")],
             [Button.inline("🎙️ Записи", b"recordings_menu"),
-             Button.inline("📋 Помощь", b"help_menu")]
+             Button.inline("🗑️ Удалить запись", b"delete_recording_menu")],
+            [Button.inline("📋 Помощь", b"help_menu")]
         ]
         
         if self.is_recording:
@@ -584,7 +599,7 @@ class BotInterface:
             "• Точное время отправки\n"
             "• Точные паузы между сообщениями\n"
             "• Порядок сообщений\n\n"
-            "⚠️ Не используйте команды /record, /stop, /recordings во время записи!"
+            "⚠️ Не используйте команды /record, /stop, /recordings, /delete_recording во время записи!"
         )
         logger.info("Запись сообщений начата")
     
@@ -668,25 +683,235 @@ class BotInterface:
         text = "📝 **Ваши записи:**\n\n"
         buttons = []
         
-        for rec_id, recording in sorted(self.recordings.items(), 
-                                        key=lambda x: x[1]['created_at'], 
-                                        reverse=True)[:10]:  # Показываем последние 10
+        recordings_list = sorted(self.recordings.items(), 
+                                key=lambda x: x[1]['created_at'], 
+                                reverse=True)
+        
+        for idx, (rec_id, recording) in enumerate(recordings_list[:10], 1):  # Показываем последние 10
             
             rec_name = recording.get('name', f"Запись {rec_id[:8]}")
             msg_count = recording.get('message_count', len(recording.get('messages', [])))
             created_time = datetime.fromtimestamp(recording['created_at']).strftime('%d.%m %H:%M')
             duration = recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0)
             
-            text_line = f"• **{rec_name}**\n"
+            text_line = f"**{idx}. {rec_name}**\n"
             text_line += f"  📊 {msg_count} сообщ., ⏱️ {duration:.1f}с, 📅 {created_time}\n"
             text += text_line
             
-            buttons.append([Button.inline(f"▶️ {rec_name[:30]}", f"play_recording_{rec_id}")])
+            buttons.append([
+                Button.inline(f"▶️ {rec_name[:20]}", f"play_recording_{rec_id}"),
+                Button.inline(f"🗑️", f"confirm_delete_{rec_id}")
+            ])
         
-        buttons.append([Button.inline("🗑️ Удалить запись", b"delete_recording_menu")])
+        buttons.append([Button.inline("🗑️ Удалить все записи", b"delete_all_confirm")])
         buttons.append([Button.inline("↩️ Назад", b"main_menu")])
         
         await event.reply(text, buttons=buttons, parse_mode='md')
+    
+    async def show_delete_recordings_menu(self, event):
+        """Показать меню удаления записей"""
+        if not self.recordings:
+            await event.reply(
+                "🗑️ **Нет записей для удаления**\n\n"
+                "У вас пока нет сохраненных записей.",
+                buttons=[
+                    [Button.inline("🎬 Начать запись", b"start_recording")],
+                    [Button.inline("↩️ Назад", b"main_menu")]
+                ]
+            )
+            return
+        
+        text = "🗑️ **Удаление записей:**\n\n"
+        text += "Отправьте номер записи для удаления:\n\n"
+        
+        recordings_list = sorted(self.recordings.items(), 
+                                key=lambda x: x[1]['created_at'], 
+                                reverse=True)
+        
+        for idx, (rec_id, recording) in enumerate(recordings_list[:15], 1):  # Показываем до 15 записей
+            rec_name = recording.get('name', f"Запись {rec_id[:8]}")
+            msg_count = recording.get('message_count', len(recording.get('messages', [])))
+            created_time = datetime.fromtimestamp(recording['created_at']).strftime('%d.%m %H:%M')
+            
+            text += f"**{idx}.** {rec_name}\n"
+            text += f"     📊 {msg_count} сообщ., 📅 {created_time}\n\n"
+        
+        text += "\n**Или используйте кнопки ниже:**"
+        
+        buttons = [
+            [Button.inline("🗑️ Удалить все записи", b"delete_all_confirm")],
+            [Button.inline("🔙 К списку записей", b"recordings_menu")],
+            [Button.inline("↩️ Назад", b"main_menu")]
+        ]
+        
+        await event.reply(text, buttons=buttons, parse_mode='md')
+        
+        # Устанавливаем состояние ожидания ввода номера
+        self.pending_deletion = {
+            'type': 'by_number',
+            'event': event
+        }
+    
+    async def handle_delete_input(self, event):
+        """Обработка ввода номера записи для удаления"""
+        if not self.pending_deletion:
+            return
+        
+        try:
+            user_input = event.message.text.strip()
+            
+            # Проверяем, является ли ввод числом
+            if not user_input.isdigit():
+                await event.reply("❌ Пожалуйста, введите номер записи (число).")
+                return
+            
+            record_number = int(user_input)
+            
+            # Получаем список записей
+            recordings_list = sorted(self.recordings.items(), 
+                                    key=lambda x: x[1]['created_at'], 
+                                    reverse=True)
+            
+            # Проверяем, существует ли запись с таким номером
+            if record_number < 1 or record_number > len(recordings_list):
+                await event.reply(f"❌ Записи с номером {record_number} не существует.")
+                return
+            
+            # Получаем запись для удаления
+            rec_id, recording = recordings_list[record_number - 1]
+            rec_name = recording.get('name', f"Запись {rec_id[:8]}")
+            
+            # Удаляем запись
+            del self.recordings[rec_id]
+            self.save_recordings()
+            
+            # Удаляем сообщение с вводом
+            try:
+                await event.delete()
+            except:
+                pass
+            
+            # Отправляем подтверждение
+            original_event = self.pending_deletion['event']
+            await original_event.edit(
+                f"✅ **Запись удалена!**\n\n"
+                f"🗑️ Удалена запись: **{rec_name}**\n"
+                f"📝 ID: `{rec_id}`\n"
+                f"📊 Сообщений: {recording.get('message_count', 0)}\n"
+                f"📅 Создана: {datetime.fromtimestamp(recording['created_at']).strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Осталось записей: **{len(self.recordings)}**",
+                buttons=[
+                    [Button.inline("🗑️ Удалить еще", b"delete_recording_menu")],
+                    [Button.inline("📝 Список записей", b"recordings_menu")],
+                    [Button.inline("↩️ Назад", b"main_menu")]
+                ]
+            )
+            
+            logger.info(f"Запись удалена: {rec_id} ({rec_name})")
+            
+            # Сбрасываем состояние
+            self.pending_deletion = None
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки ввода удаления: {e}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
+    
+    async def delete_recording_by_id(self, event, recording_id):
+        """Удалить запись по ID"""
+        if recording_id not in self.recordings:
+            await event.answer("❌ Запись не найдена!", alert=True)
+            return
+        
+        recording = self.recordings[recording_id]
+        rec_name = recording.get('name', f"Запись {recording_id[:8]}")
+        
+        # Удаляем запись
+        del self.recordings[recording_id]
+        self.save_recordings()
+        
+        await event.edit(
+            f"✅ **Запись удалена!**\n\n"
+            f"🗑️ Удалена запись: **{rec_name}**\n"
+            f"📝 ID: `{recording_id}`\n"
+            f"📊 Сообщений: {recording.get('message_count', 0)}\n"
+            f"📅 Создана: {datetime.fromtimestamp(recording['created_at']).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"Осталось записей: **{len(self.recordings)}**",
+            buttons=[
+                [Button.inline("🗑️ Удалить еще", b"delete_recording_menu")],
+                [Button.inline("📝 Список записей", b"recordings_menu")],
+                [Button.inline("↩️ Назад", b"main_menu")]
+            ]
+        )
+        
+        logger.info(f"Запись удалена: {recording_id} ({rec_name})")
+    
+    async def confirm_delete_all(self, event):
+        """Подтверждение удаления всех записей"""
+        if not self.recordings:
+            await event.answer("❌ Нет записей для удаления!", alert=True)
+            return
+        
+        total_records = len(self.recordings)
+        total_messages = sum(len(rec['messages']) for rec in self.recordings.values())
+        
+        await event.edit(
+            f"⚠️ **Внимание! Вы собираетесь удалить ВСЕ записи!**\n\n"
+            f"📊 Статистика для удаления:\n"
+            f"• 📝 Всего записей: **{total_records}**\n"
+            f"• 💬 Всего сообщений: **{total_messages}**\n"
+            f"• 📅 Самая старая запись: {self.get_oldest_recording_date()}\n"
+            f"• 📅 Самая новая запись: {self.get_newest_recording_date()}\n\n"
+            f"**Это действие нельзя отменить!**\n"
+            f"Все записи будут удалены безвозвратно.",
+            buttons=[
+                [Button.inline("✅ Да, удалить ВСЕ", b"delete_all_execute")],
+                [Button.inline("❌ Нет, отменить", b"recordings_menu")]
+            ]
+        )
+    
+    def get_oldest_recording_date(self):
+        """Получить дату самой старой записи"""
+        if not self.recordings:
+            return "нет записей"
+        
+        oldest = min(self.recordings.values(), key=lambda x: x['created_at'])
+        return datetime.fromtimestamp(oldest['created_at']).strftime('%d.%m.%Y %H:%M')
+    
+    def get_newest_recording_date(self):
+        """Получить дату самой новой записи"""
+        if not self.recordings:
+            return "нет записей"
+        
+        newest = max(self.recordings.values(), key=lambda x: x['created_at'])
+        return datetime.fromtimestamp(newest['created_at']).strftime('%d.%m.%Y %H:%M')
+    
+    async def delete_all_recordings(self, event):
+        """Удалить все записи"""
+        if not self.recordings:
+            await event.edit("❌ Нет записей для удаления!")
+            return
+        
+        # Сохраняем статистику перед удалением
+        total_records = len(self.recordings)
+        total_messages = sum(len(rec['messages']) for rec in self.recordings.values())
+        
+        # Удаляем все записи
+        self.recordings.clear()
+        self.save_recordings()
+        
+        await event.edit(
+            f"🗑️ **Все записи удалены!**\n\n"
+            f"📊 Удалено:\n"
+            f"• 📝 Записей: **{total_records}**\n"
+            f"• 💬 Сообщений: **{total_messages}**\n\n"
+            f"Теперь у вас нет сохраненных записей.",
+            buttons=[
+                [Button.inline("🎬 Начать запись", b"start_recording")],
+                [Button.inline("↩️ Назад", b"main_menu")]
+            ]
+        )
+        
+        logger.info(f"Удалены все записи: {total_records} записей, {total_messages} сообщений")
     
     async def play_recording(self, event, recording_id):
         """Воспроизвести запись"""
@@ -714,6 +939,7 @@ class BotInterface:
                 "Или нажмите кнопку 'Отправить сюда'",
                 buttons=[
                     [Button.inline("📨 Отправить сюда", f"send_here_{recording_id}")],
+                    [Button.inline("🗑️ Удалить запись", f"confirm_delete_{recording_id}")],
                     [Button.inline("↩️ Назад", b"recordings_menu")]
                 ]
             )
@@ -1672,6 +1898,8 @@ class BotInterface:
     
     async def show_stats(self, event):
         """Показать статистику"""
+        total_messages = self.count_messages_in_recordings()
+        
         stats_text = (
             f"📊 **Статистика бота**\n\n"
             f"📅 **Дата:** {datetime.now().strftime('%Y-%m-%d')}\n\n"
@@ -1681,6 +1909,7 @@ class BotInterface:
             f"• 👤 Пользователей в черном списке: **{len(self.config['blacklist'])}**\n"
             f"• 💬 Мониторится чатов: **{'Все' if self.config['enabled_for_all'] else len(self.config['enabled_chats'])}**\n"
             f"• 📝 Записей сохранено: **{len(self.recordings)}**\n"
+            f"• 💬 Сообщений в записях: **{total_messages}**\n"
             f"• ⚡ Статус мониторинга: **{'✅ Активен' if self.active_monitoring else '⏸️ Приостановлен'}**"
         )
         
@@ -1705,6 +1934,7 @@ class BotInterface:
         `/record` - Начать запись сообщений
         `/stop` - Остановить запись
         `/recordings` - Управление записями
+        `/delete_recording` - Удалить запись
         `/help` - Эта справка\n\n
         **⚡ Как это работает:**
         1. Добавьте пользователей в черный список
@@ -1721,6 +1951,7 @@ class BotInterface:
         6. **Можно следить за сообщениями врага и отвечать на них**
         7. **Если враг удалил сообщение, бот найдет его предыдущее или следующее**
         8. **Сохраняются точные паузы между сообщениями**
+        9. **Можно удалять записи через меню**
         """
         
         buttons = [
@@ -1826,6 +2057,9 @@ class BotInterface:
             elif data == 'recordings_menu':
                 await self.show_recordings_menu(event)
             
+            elif data == 'delete_recording_menu':
+                await self.show_delete_recordings_menu(event)
+            
             elif data == 'start_recording':
                 await self.start_recording(event)
             
@@ -1835,6 +2069,20 @@ class BotInterface:
             elif data.startswith('play_recording_'):
                 recording_id = data.replace('play_recording_', '')
                 await self.play_recording(event, recording_id)
+            
+            elif data.startswith('confirm_delete_'):
+                recording_id = data.replace('confirm_delete_', '')
+                await self.confirm_delete_single(event, recording_id)
+            
+            elif data.startswith('delete_single_'):
+                recording_id = data.replace('delete_single_', '')
+                await self.delete_recording_by_id(event, recording_id)
+            
+            elif data == 'delete_all_confirm':
+                await self.confirm_delete_all(event)
+            
+            elif data == 'delete_all_execute':
+                await self.delete_all_recordings(event)
             
             elif data.startswith('send_here_'):
                 # Формат: send_here_{recording_id}
@@ -1919,7 +2167,8 @@ class BotInterface:
                     "`/toggle`\n"
                     "`/record`\n"
                     "`/stop`\n"
-                    "`/recordings`",
+                    "`/recordings`\n"
+                    "`/delete_recording`",
                     buttons=[[Button.inline("↩️ Назад", b"help_menu")]]
                 )
             
@@ -1979,6 +2228,29 @@ class BotInterface:
         except Exception as e:
             logger.error(f"Ошибка обработки callback: {e}")
             await event.answer("❌ Ошибка", alert=True)
+    
+    async def confirm_delete_single(self, event, recording_id):
+        """Подтверждение удаления одной записи"""
+        if recording_id not in self.recordings:
+            await event.answer("❌ Запись не найдена!", alert=True)
+            return
+        
+        recording = self.recordings[recording_id]
+        rec_name = recording.get('name', f"Запись {recording_id[:8]}")
+        
+        await event.edit(
+            f"⚠️ **Подтверждение удаления**\n\n"
+            f"Вы уверены, что хотите удалить запись?\n\n"
+            f"📝 **{rec_name}**\n"
+            f"📊 Сообщений: {recording.get('message_count', 0)}\n"
+            f"⏱️ Длительность: {recording.get('total_duration', recording['messages'][-1]['time_offset'] if recording['messages'] else 0):.1f}с\n"
+            f"📅 Создана: {datetime.fromtimestamp(recording['created_at']).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"Это действие нельзя отменить!",
+            buttons=[
+                [Button.inline("✅ Да, удалить", f"delete_single_{recording_id}")],
+                [Button.inline("❌ Нет, отменить", b"recordings_menu")]
+            ]
+        )
     
     async def remove_user_by_id(self, event, user_id):
         """Удаление пользователя по ID"""
@@ -2045,19 +2317,22 @@ class BotInterface:
     
     async def send_welcome_message(self):
         """Отправить приветственное сообщение"""
+        total_messages = self.count_messages_in_recordings()
+        
         welcome_text = (
             f"🤖 **Бот для автоматического удаления сообщений запущен!**\n\n"
             f"👤 **Владелец:** {OWNER_ID}\n"
             f"👥 **Пользователей в черном списке:** {len(self.config['blacklist'])}\n"
             f"💬 **Мониторинг чатов:** {'🌐 Все чаты' if self.config['enabled_for_all'] else f'💬 {len(self.config['enabled_chats'])} чатов'}\n"
-            f"📝 **Сохранено записей:** {len(self.recordings)} ({self.count_messages_in_recordings()} сообщений)\n"
+            f"📝 **Сохранено записей:** {len(self.recordings)} ({total_messages} сообщений)\n"
             f"⚡ **Режим:** {'Активный мониторинг' if self.active_monitoring else 'Приостановлен'}\n\n"
             f"⚠️ **Уведомления об удалении:** {'Включены' if self.config['delete_notifications'] else 'Отключены'}\n\n"
             f"🎬 **Новые функции:**\n"
             f"• 📨 Отправка записей с отслеживанием сообщений врага!\n"
             f"• 🔄 Автопоиск сообщений если враг удалил сообщение\n"
             f"• ⏱️ Точное сохранение скорости и пауз\n"
-            f"• 🔧 Исправление старых записей\n\n"
+            f"• 🔧 Исправление старых записей\n"
+            f"• 🗑️ Удаление записей (по одной или всех сразу)\n\n"
             f"📋 **Используйте /menu для управления**"
         )
         
@@ -2093,6 +2368,7 @@ async def main():
     print("• 🔄 Автопоиск ПРЕДЫДУЩЕГО или СЛЕДУЮЩЕГО сообщения если удалено")
     print("• ⏱️ Точное сохранение оригинальной скорости (миллисекунды)")
     print("• 🔧 Автоматическое исправление старых записей")
+    print("• 🗑️ Удаление записей (по одной или всех сразу)")
     print("• 💾 Сохранение записей между перезагрузками")
     print("• 🔕 Уведомления об удалении отключены")
     print("=" * 60)
